@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mirage-core",
+    "crates/miraged",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Theorhd/mirage-core"
+
+[workspace.dependencies]
+bytes = { version = "1.9", default-features = false, features = ["std"] }
+zeroize = { version = "1.8", default-features = false, features = ["alloc", "derive"] }
+tokio = { version = "1.43", default-features = false, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+rustix = { version = "0.38", default-features = false, features = ["std", "process"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = true
