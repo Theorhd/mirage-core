@@ -112,6 +112,31 @@ mirage-core/
 
 ---
 
+## Docker Deployment (Prebuilt GHCR Image — No Source Code Required)
+
+Multi-architecture static `FROM scratch` images (`linux/amd64` and `linux/arm64`) are built and published automatically to GitHub Container Registry on every push to `dev` / `main` and version tags (`v*`):
+
+```bash
+# Pull the hardened FROM scratch image directly on any VPS
+docker pull ghcr.io/theorhd/mirage-core:latest
+
+# Generate Reality keys + UUIDv4 without Rust/Cargo installed
+docker run --rm --user 65534:65534 --read-only --cap-drop=ALL \
+  --security-opt no-new-privileges:true ghcr.io/theorhd/mirage-core:latest keygen
+```
+
+To deploy with the hardened `docker-compose.yml` profile (no repository clone needed):
+
+```bash
+mkdir -p mirage-core/secrets && cd mirage-core
+curl -fsSLO https://raw.githubusercontent.com/Theorhd/mirage-core/dev/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/Theorhd/mirage-core/dev/seccomp-miraged.json
+# Place your config in ./secrets/config.toml (chmod 0400, owner 65534:65534), then:
+docker compose pull && docker compose up -d
+```
+
+---
+
 ## Security Principles
 
 1. **Sans-I/O Isolation**: Separating state machines and cryptographic verification from socket I/O minimizes attack surface, avoids hidden state coupling, and enables thorough fuzzing and boundary testing on raw byte inputs.

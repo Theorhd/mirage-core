@@ -739,16 +739,19 @@ async fn read_vless_header(
 
     let parsed = tokio::time::timeout(timeout_dur, async {
         loop {
-            while let Ok(Some((inner_ct, payload))) = tls_reader.next_record() {
+            while let Ok(Some((inner_ct, mut payload))) = tls_reader.next_record() {
                 if inner_ct == 0x15 {
+                    payload.zeroize();
                     return None;
                 }
                 if inner_ct == 0x17 {
                     let new_len = app_buf.len().saturating_add(payload.len());
                     if new_len > MAX_VLESS_HEADER_BYTES {
+                        payload.zeroize();
                         return None;
                     }
                     app_buf.extend_from_slice(&payload);
+                    payload.zeroize();
 
                     match parse_vless_request(&mut app_buf, vless_cfg.uuids()) {
                         VlessParseOutcome::NeedMoreData => continue,
@@ -766,6 +769,7 @@ async fn read_vless_header(
                         }
                     }
                 }
+                payload.zeroize();
             }
 
             let n = client.read(&mut wire_chunk).await.ok()?;
@@ -860,17 +864,23 @@ async fn relay_plain_uplink(
     let mut wire = [0u8; PLAIN_RELAY_CHUNK_SIZE];
     loop {
         match tls_reader.next_record() {
-            Ok(Some((0x17, payload))) => {
-                if !payload.is_empty() && up_write.write_all(&payload).await.is_err() {
+            Ok(Some((0x17, mut payload))) => {
+                let write_err = !payload.is_empty() && up_write.write_all(&payload).await.is_err();
+                payload.zeroize();
+                if write_err {
                     break;
                 }
                 continue;
             }
-            Ok(Some((0x15, _))) => {
+            Ok(Some((0x15, mut payload))) => {
+                payload.zeroize();
                 let _ = up_write.shutdown().await;
                 break;
             }
-            Ok(Some(_)) => continue,
+            Ok(Some((_, mut payload))) => {
+                payload.zeroize();
+                continue;
+            }
             Ok(None) => {}
             Err(_) => break,
         }
@@ -991,19 +1001,25 @@ async fn relay_vision_uplink(
     loop {
         loop {
             match tls_reader.next_record() {
-                Ok(Some((0x17, payload))) => {
-                    let out = unpadder.feed(&payload);
+                Ok(Some((0x17, mut payload))) => {
+                    let mut out = unpadder.feed(&payload);
+                    payload.zeroize();
                     if !out.payload.is_empty() {
                         inspect_vision_filter(&out.payload, &tls_filter, &filter_done);
-                        if up_write.write_all(&out.payload).await.is_err() {
+                        let err = up_write.write_all(&out.payload).await.is_err();
+                        out.payload.zeroize();
+                        if err {
+                            out.direct_trailing.zeroize();
                             return;
                         }
                     }
                     if out.mode == UnpadMode::DirectCopy {
-                        if !out.direct_trailing.is_empty()
-                            && up_write.write_all(&out.direct_trailing).await.is_err()
-                        {
-                            return;
+                        if !out.direct_trailing.is_empty() {
+                            let err = up_write.write_all(&out.direct_trailing).await.is_err();
+                            out.direct_trailing.zeroize();
+                            if err {
+                                return;
+                            }
                         }
                         let rem_raw = tls_reader.into_remaining_wire_bytes();
                         if !rem_raw.is_empty() && up_write.write_all(&rem_raw).await.is_err() {
@@ -1014,11 +1030,15 @@ async fn relay_vision_uplink(
                         return;
                     }
                 }
-                Ok(Some((0x15, _))) => {
+                Ok(Some((0x15, mut payload))) => {
+                    payload.zeroize();
                     let _ = up_write.shutdown().await;
                     return;
                 }
-                Ok(Some(_)) => continue,
+                Ok(Some((_, mut payload))) => {
+                    payload.zeroize();
+                    continue;
+                }
                 Ok(None) => break,
                 Err(_) => return,
             }
@@ -1253,17 +1273,21 @@ async fn relay_vless_udp(
 
             loop {
                 match tls_reader.next_record() {
-                    Ok(Some((0x17, payload))) => {
+                    Ok(Some((0x17, mut payload))) => {
                         let unread_len = pkt_buf.len().saturating_sub(pkt_offset);
                         if unread_len.saturating_add(payload.len()) > MAX_UDP_STREAM_BUFFER {
+                            payload.zeroize();
                             return;
                         }
                         pkt_buf.extend_from_slice(&payload);
+                        payload.zeroize();
                         while let Some(avail) = pkt_buf.get(pkt_offset..) {
                             match decode_udp_packet(avail) {
-                                Ok(Some((pkt, consumed))) => {
+                                Ok(Some((mut pkt, consumed))) => {
                                     pkt_offset = pkt_offset.saturating_add(consumed);
-                                    if udp_send.send(&pkt).await.is_err() {
+                                    let send_err = udp_send.send(&pkt).await.is_err();
+                                    pkt.zeroize();
+                                    if send_err {
                                         return;
                                     }
                                 }
@@ -1279,8 +1303,14 @@ async fn relay_vless_udp(
                             pkt_offset = 0;
                         }
                     }
-                    Ok(Some((0x15, _))) => return,
-                    Ok(Some(_)) => continue,
+                    Ok(Some((0x15, mut payload))) => {
+                        payload.zeroize();
+                        return;
+                    }
+                    Ok(Some((_, mut payload))) => {
+                        payload.zeroize();
+                        continue;
+                    }
                     Ok(None) => break,
                     Err(_) => return,
                 }

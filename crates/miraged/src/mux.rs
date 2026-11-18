@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::dns::DnsResolver;
@@ -34,6 +34,12 @@ const MAX_MUX_STREAM_BUFFER: usize = 256 * 1024;
 
 /// Maximum concurrent multiplexed TCP sub-sessions allowed per tunnel.
 const MAX_MUX_TCP_SUBSESSIONS: usize = 256;
+
+/// Maximum concurrent multiplexed UDP sub-sessions tracked per tunnel.
+const MAX_MUX_UDP_SUBSESSIONS: usize = 256;
+
+/// Maximum distinct Full-Cone XUDP sessions referenced by a single tunnel.
+const MAX_TUNNEL_XUDP_SESSIONS: usize = 128;
 
 /// Maximum concurrent Full-Cone XUDP/UDP NAT mappings retained globally in RAM.
 const MAX_GLOBAL_UDP_SESSIONS: usize = 1024;
@@ -65,6 +71,8 @@ enum UdpNatKey {
 struct UdpNatEntry {
     v4_sock: tokio::sync::Mutex<Option<Arc<UdpSocket>>>,
     v6_sock: tokio::sync::Mutex<Option<Arc<UdpSocket>>>,
+    v4_reader: Mutex<Option<AbortHandle>>,
+    v6_reader: Mutex<Option<AbortHandle>>,
     active_sink: Mutex<Option<(u16, mpsc::Sender<MuxFrame>)>>,
     last_active_ms: AtomicU64,
 }
@@ -74,6 +82,8 @@ impl UdpNatEntry {
         Self {
             v4_sock: tokio::sync::Mutex::new(None),
             v6_sock: tokio::sync::Mutex::new(None),
+            v4_reader: Mutex::new(None),
+            v6_reader: Mutex::new(None),
             active_sink: Mutex::new(Some((session_id, tx))),
             last_active_ms: AtomicU64::new(now_ms),
         }
@@ -97,6 +107,26 @@ impl UdpNatEntry {
             if cur_tx.same_channel(tx) {
                 *guard = None;
             }
+        }
+    }
+
+    fn shutdown(&self) {
+        *self.active_sink.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some(h) = self
+            .v4_reader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            h.abort();
+        }
+        if let Some(h) = self
+            .v6_reader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            h.abort();
         }
     }
 }
@@ -151,7 +181,12 @@ impl GlobalUdpTable {
 
         if guard.len() >= MAX_GLOBAL_UDP_SESSIONS {
             guard.retain(|_, v| {
-                now_ms.saturating_sub(v.last_active_ms.load(Ordering::Relaxed)) < idle_ms
+                let keep =
+                    now_ms.saturating_sub(v.last_active_ms.load(Ordering::Relaxed)) < idle_ms;
+                if !keep {
+                    v.shutdown();
+                }
+                keep
             });
             if guard.len() >= MAX_GLOBAL_UDP_SESSIONS {
                 if let Some(oldest_key) = guard
@@ -159,7 +194,9 @@ impl GlobalUdpTable {
                     .min_by_key(|(_, v)| v.last_active_ms.load(Ordering::Relaxed))
                     .map(|(k, _)| *k)
                 {
-                    guard.remove(&oldest_key);
+                    if let Some(evicted) = guard.remove(&oldest_key) {
+                        evicted.shutdown();
+                    }
                 }
             }
         }
@@ -171,17 +208,24 @@ impl GlobalUdpTable {
 
     fn remove_local_session(&self, tunnel_id: u64, session_id: u16) {
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        guard.remove(&UdpNatKey::Local {
+        if let Some(removed) = guard.remove(&UdpNatKey::Local {
             tunnel_id,
             session_id,
-        });
+        }) {
+            removed.shutdown();
+        }
     }
 
     fn cleanup_tunnel_locals(&self, tunnel_id: u64) {
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(
-            |k, _| !matches!(k, UdpNatKey::Local { tunnel_id: tid, .. } if *tid == tunnel_id),
-        );
+        guard.retain(|k, v| {
+            let is_local =
+                matches!(k, UdpNatKey::Local { tunnel_id: tid, .. } if *tid == tunnel_id);
+            if is_local {
+                v.shutdown();
+            }
+            !is_local
+        });
     }
 
     fn remove_if_idle(&self, key: UdpNatKey, idle_ms: u64) {
@@ -189,7 +233,9 @@ impl GlobalUdpTable {
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.get(&key) {
             if now_ms.saturating_sub(entry.last_active_ms.load(Ordering::Relaxed)) >= idle_ms {
-                guard.remove(&key);
+                if let Some(removed) = guard.remove(&key) {
+                    removed.shutdown();
+                }
             }
         }
     }
@@ -315,16 +361,24 @@ pub async fn relay_vless_mux(
         let mut drained_record = false;
         loop {
             match tls_reader.next_record() {
-                Ok(Some((0x17, payload))) => {
+                Ok(Some((0x17, mut payload))) => {
                     let unread = mux_buf.len().saturating_sub(mux_off);
                     if unread.saturating_add(payload.len()) > MAX_MUX_STREAM_BUFFER {
+                        payload.zeroize();
                         break 'outer;
                     }
                     mux_buf.extend_from_slice(&payload);
+                    payload.zeroize();
                     drained_record = true;
                 }
-                Ok(Some((0x15, _))) => break 'outer,
-                Ok(Some(_)) => continue,
+                Ok(Some((0x15, mut payload))) => {
+                    payload.zeroize();
+                    break 'outer;
+                }
+                Ok(Some((_, mut payload))) => {
+                    payload.zeroize();
+                    continue;
+                }
                 Ok(None) => break,
                 Err(_) => break 'outer,
             }
@@ -426,6 +480,20 @@ async fn handle_decoded_mux_frame(
                     tcp_subs.insert(frame.id, (up_tx, handle));
                 }
                 MuxNetwork::Udp => {
+                    if !udp_subs.contains_key(&frame.id)
+                        && udp_subs.len() >= MAX_MUX_UDP_SUBSESSIONS
+                    {
+                        let _ = mux_tx.try_send(MuxFrame {
+                            id: frame.id,
+                            status: MuxStatus::End,
+                            opt_data: false,
+                            opt_error: true,
+                            target: None,
+                            global_id: None,
+                            payload: Zeroizing::new(Vec::new()),
+                        });
+                        return;
+                    }
                     metrics.inc_mux_substreams();
                     let key = match frame.global_id {
                         Some(gid) => UdpNatKey::Xudp {
@@ -442,7 +510,17 @@ async fn handle_decoded_mux_frame(
                         default_target: Some(target.clone()),
                         resolved_cache: None,
                     };
-                    udp_subs.insert(frame.id, handle);
+                    if let Some(prev) = udp_subs.insert(frame.id, handle) {
+                        if prev.key != key {
+                            if let UdpNatKey::Local {
+                                tunnel_id: tid,
+                                session_id: sid,
+                            } = prev.key
+                            {
+                                udp_table.remove_local_session(tid, sid);
+                            }
+                        }
+                    }
 
                     if !frame.payload.is_empty() {
                         if let Some(sub) = udp_subs.get_mut(&frame.id) {
@@ -462,7 +540,9 @@ async fn handle_decoded_mux_frame(
                         }
                     } else {
                         let entry = udp_table.get_or_insert(key, frame.id, mux_tx);
-                        if matches!(key, UdpNatKey::Xudp { .. }) {
+                        if matches!(key, UdpNatKey::Xudp { .. })
+                            && active_xudp_entries.len() < MAX_TUNNEL_XUDP_SESSIONS
+                        {
                             active_xudp_entries.entry(key).or_insert(entry);
                         }
                     }
@@ -501,7 +581,7 @@ async fn handle_decoded_mux_frame(
             // Single-XUDP / client resumption: `Keep` carrying a `GlobalID` or target
             // after an implicit session `0` setup.
             if let (Some(target), Some(gid)) = (&frame.target, frame.global_id) {
-                if target.network == MuxNetwork::Udp {
+                if target.network == MuxNetwork::Udp && udp_subs.len() < MAX_MUX_UDP_SUBSESSIONS {
                     let key = UdpNatKey::Xudp {
                         uuid: uuid_bytes,
                         global_id: gid,
@@ -578,7 +658,9 @@ async fn dispatch_udp_payload(
     };
 
     let entry = udp_table.get_or_insert(sub.key, session_id, mux_tx);
-    if matches!(sub.key, UdpNatKey::Xudp { .. }) {
+    if matches!(sub.key, UdpNatKey::Xudp { .. })
+        && active_xudp_entries.len() < MAX_TUNNEL_XUDP_SESSIONS
+    {
         active_xudp_entries
             .entry(sub.key)
             .or_insert_with(|| Arc::clone(&entry));
@@ -625,7 +707,7 @@ async fn ensure_udp_socket_and_spawn_reader(
 
     let reader_sock = Arc::clone(&sock);
     let reader_entry = Arc::clone(&entry);
-    tokio::spawn(async move {
+    let join_handle = tokio::spawn(async move {
         let mut buf = [0u8; MAX_UDP_DATAGRAM_BYTES];
         let idle_ms = u64::try_from(XUDP_IDLE_TIMEOUT.as_millis()).unwrap_or(120_000);
         loop {
@@ -662,13 +744,40 @@ async fn ensure_udp_socket_and_spawn_reader(
                         let _ = tx.try_send(frame);
                     }
                 }
-                Ok(Err(_)) | Err(_) => {
-                    udp_table.remove_if_idle(key, idle_ms);
+                Err(_) => {
+                    let now_ms = udp_table.now_ms();
+                    let last_ms = reader_entry.last_active_ms.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last_ms) < idle_ms {
+                        continue;
+                    }
+                    break;
+                }
+                Ok(Err(_)) => {
                     break;
                 }
             }
         }
+        let exit_slot = if is_ipv6 {
+            &reader_entry.v6_sock
+        } else {
+            &reader_entry.v4_sock
+        };
+        *exit_slot.lock().await = None;
+        udp_table.remove_if_idle(key, idle_ms);
     });
+
+    let abort_slot = if is_ipv6 {
+        &entry.v6_reader
+    } else {
+        &entry.v4_reader
+    };
+    if let Some(prev) = abort_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(join_handle.abort_handle())
+    {
+        prev.abort();
+    }
 
     Some(sock)
 }

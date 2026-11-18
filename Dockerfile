@@ -14,7 +14,11 @@ COPY crates/miraged/Cargo.toml crates/miraged/Cargo.toml
 # Copy workspace sources.
 COPY crates crates
 
-RUN set -eu; \
+ARG TARGETARCH
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,id=mirage-target-${TARGETARCH:-host},sharing=locked \
+    set -eu; \
     ARCH="$(uname -m)"; \
     case "$ARCH" in \
         x86_64)  TARGET="x86_64-unknown-linux-musl" ;; \
@@ -27,6 +31,11 @@ RUN set -eu; \
     chmod 0555 /miraged
 
 FROM scratch
+
+LABEL org.opencontainers.image.title="mirage-core" \
+      org.opencontainers.image.description="Hardened Reality + VLESS + XTLS-Vision + Mux/XUDP proxy daemon" \
+      org.opencontainers.image.source="https://github.com/Theorhd/mirage-core" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 COPY --from=builder /miraged /miraged
 

@@ -1,6 +1,8 @@
 //! Sans-I/O XTLS-Vision framing, TLS-in-TLS inner handshake detection,
 //! random padding, and direct-copy transition state machine.
 
+use zeroize::Zeroize;
+
 use crate::vless::VlessUuid;
 
 /// Vision padding commands matching Xray-core (`proxy/proxy.go`).
@@ -205,7 +207,7 @@ pub enum UnpadMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnpadStep {
-    Initial,
+    Initial(usize),
     Header(usize),
     Content(usize),
     Padding(usize),
@@ -217,10 +219,18 @@ pub struct VisionUnpadder {
     user_uuid: VlessUuid,
     mode: UnpadMode,
     step: UnpadStep,
+    uuid_buf: [u8; 16],
     hdr_buf: [u8; 5],
     current_command: VisionCommand,
     content_len: usize,
     padding_len: usize,
+}
+
+impl Drop for VisionUnpadder {
+    fn drop(&mut self) {
+        self.uuid_buf.zeroize();
+        self.hdr_buf.zeroize();
+    }
 }
 
 /// Output produced by [`VisionUnpadder::feed`].
@@ -241,7 +251,8 @@ impl VisionUnpadder {
         Self {
             user_uuid,
             mode: UnpadMode::Padding,
-            step: UnpadStep::Initial,
+            step: UnpadStep::Initial(0),
+            uuid_buf: [0u8; 16],
             hdr_buf: [0u8; 5],
             current_command: VisionCommand::Continue,
             content_len: 0,
@@ -274,41 +285,45 @@ impl VisionUnpadder {
             };
         }
 
-        let mut slice = input;
+        let slice = input;
         let mut payload = Vec::with_capacity(input.len());
-
-        if self.step == UnpadStep::Initial {
-            if slice.len() >= 21 {
-                if let Some(prefix) = slice.get(..16) {
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(prefix);
-                    if self.user_uuid.ct_eq_bytes(&arr) {
-                        slice = slice.get(16..).unwrap_or(&[]);
-                        self.step = UnpadStep::Header(0);
-                    } else {
-                        self.mode = UnpadMode::Passthrough;
-                        return UnpaddedOutput {
-                            payload: slice.to_vec(),
-                            mode: self.mode,
-                            direct_trailing: Vec::new(),
-                        };
-                    }
-                }
-            } else {
-                self.mode = UnpadMode::Passthrough;
-                return UnpaddedOutput {
-                    payload: slice.to_vec(),
-                    mode: self.mode,
-                    direct_trailing: Vec::new(),
-                };
-            }
-        }
 
         let mut idx = 0usize;
         while idx < slice.len() {
             match self.step {
-                UnpadStep::Initial => {
-                    self.step = UnpadStep::Header(0);
+                UnpadStep::Initial(pos) => {
+                    let avail = slice.len().saturating_sub(idx);
+                    let need = 16usize.saturating_sub(pos);
+                    let take = need.min(avail);
+                    if let (Some(dst), Some(src)) = (
+                        self.uuid_buf.get_mut(pos..pos.saturating_add(take)),
+                        slice.get(idx..idx.saturating_add(take)),
+                    ) {
+                        dst.copy_from_slice(src);
+                    }
+                    idx = idx.saturating_add(take);
+                    let next_pos = pos.saturating_add(take);
+                    if next_pos == 16 {
+                        let matched = self.user_uuid.ct_eq_bytes(&self.uuid_buf);
+                        if matched {
+                            self.uuid_buf.zeroize();
+                            self.step = UnpadStep::Header(0);
+                        } else {
+                            self.mode = UnpadMode::Passthrough;
+                            payload.extend_from_slice(&self.uuid_buf);
+                            self.uuid_buf.zeroize();
+                            if let Some(rem) = slice.get(idx..) {
+                                payload.extend_from_slice(rem);
+                            }
+                            return UnpaddedOutput {
+                                payload,
+                                mode: self.mode,
+                                direct_trailing: Vec::new(),
+                            };
+                        }
+                    } else {
+                        self.step = UnpadStep::Initial(next_pos);
+                    }
                 }
                 UnpadStep::Header(pos) => {
                     let Some(&b) = slice.get(idx) else {
@@ -398,13 +413,13 @@ impl VisionUnpadder {
             }
             VisionCommand::End => {
                 self.mode = UnpadMode::Passthrough;
-                self.step = UnpadStep::Initial;
+                self.step = UnpadStep::Initial(0);
                 payload.extend_from_slice(trailing);
                 true
             }
             VisionCommand::Direct => {
                 self.mode = UnpadMode::DirectCopy;
-                self.step = UnpadStep::Initial;
+                self.step = UnpadStep::Initial(0);
                 true
             }
         }
@@ -646,5 +661,28 @@ mod tests {
         assert!(!padder.is_padding());
         assert!(!padder.direct_copy_active());
         assert_eq!(unpadder.mode(), UnpadMode::Passthrough);
+    }
+
+    #[test]
+    fn vision_unpadder_handles_fragmented_initial_uuid_and_header() {
+        let Ok(uuid) = VlessUuid::from_str_hex("11223344-5566-7788-99aa-bbccddeeff00") else {
+            return;
+        };
+        let mut padder = VisionPadder::new(uuid.clone());
+        let mut unpadder = VisionUnpadder::new(uuid);
+        let mut filter = VisionTlsFilter::new();
+
+        let ch = b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00";
+        filter.inspect(ch);
+        let blk = padder.wrap_outbound(ch, &filter, 123);
+
+        // Feed 1 byte at a time across the 16-byte UUID, 5-byte Vision header, content, and padding!
+        let mut collected = Vec::new();
+        for byte in &blk {
+            let out = unpadder.feed(core::slice::from_ref(byte));
+            collected.extend_from_slice(&out.payload);
+        }
+        assert_eq!(collected, ch);
+        assert_eq!(unpadder.mode(), UnpadMode::Padding);
     }
 }

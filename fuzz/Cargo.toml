@@ -17,3 +17,31 @@ path = "fuzz_targets/client_hello.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dest_server_flight"
+path = "fuzz_targets/dest_server_flight.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vless_request"
+path = "fuzz_targets/vless_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vision_unpad"
+path = "fuzz_targets/vision_unpad.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux_frame"
+path = "fuzz_targets/mux_frame.rs"
+test = false
+doc = false
+bench = false

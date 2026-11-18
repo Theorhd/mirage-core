@@ -14,10 +14,16 @@ const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 
 /// Maximum TLS plaintext record fragment length per RFC 8446 §5.1.
-const MAX_TLS_RECORD_FRAGMENT: usize = 16 * 1024;
+pub const MAX_TLS_RECORD_FRAGMENT: usize = 16 * 1024;
+
+/// Maximum TLS 1.3 encrypted record fragment length per RFC 8446 §5.4 (`2^14 + 256`).
+pub const MAX_TLS_CIPHERTEXT_RECORD_LEN: usize = MAX_TLS_RECORD_FRAGMENT + 256;
 
 /// TLS extension type: `server_name` (SNI).
 const EXT_SERVER_NAME: u16 = 0x0000;
+
+/// TLS extension type: `application_layer_protocol_negotiation` (ALPN).
+const EXT_ALPN: u16 = 0x0010;
 
 /// TLS extension type: `supported_versions`.
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
@@ -200,6 +206,26 @@ impl KeyShares {
     }
 }
 
+/// Preferred ALPN protocol offered by the client in extension `0x0010`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferedAlpn {
+    /// Client offered `"h2"`.
+    H2,
+    /// Client offered `"http/1.1"` (without `"h2"`).
+    Http11,
+}
+
+impl OfferedAlpn {
+    /// Returns the wire protocol bytes (`b"h2"` or `b"http/1.1"`).
+    #[must_use]
+    pub const fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::H2 => b"h2",
+            Self::Http11 => b"http/1.1",
+        }
+    }
+}
+
 /// Parsed fields of a TLS `ClientHello` required for SNI routing and Reality auth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHelloInfo {
@@ -211,6 +237,8 @@ pub struct ClientHelloInfo {
     pub session_id: SessionId,
     /// Extracted SNI `host_name`, if present.
     pub sni: Option<SniHost>,
+    /// Preferred ALPN protocol offered by the client (`h2` or `http/1.1`), if any.
+    pub offered_alpn: Option<OfferedAlpn>,
     /// Key shares offered in the `key_share` extension.
     pub key_shares: KeyShares,
     /// Whether `supported_versions` advertises TLS 1.3 (`0x0304`).
@@ -539,6 +567,7 @@ fn parse_client_hello_body(
     let _ = r.read_slice(compression_len)?;
 
     let mut sni = None;
+    let mut offered_alpn = None;
     let mut key_shares = KeyShares::default();
     let mut offers_tls13 = false;
 
@@ -551,6 +580,7 @@ fn parse_client_hello_body(
 
         let mut ext_reader = SliceReader::new(extensions_slice);
         let mut seen_sni = false;
+        let mut seen_alpn = false;
         let mut seen_key_share = false;
         let mut seen_supported_versions = false;
 
@@ -566,6 +596,13 @@ fn parse_client_hello_body(
                     }
                     seen_sni = true;
                     sni = Some(parse_sni_extension(ext_data)?);
+                }
+                EXT_ALPN => {
+                    if seen_alpn {
+                        return Err(FallbackReason::Malformed);
+                    }
+                    seen_alpn = true;
+                    offered_alpn = parse_alpn_extension(ext_data)?;
                 }
                 EXT_KEY_SHARE => {
                     if seen_key_share {
@@ -591,10 +628,42 @@ fn parse_client_hello_body(
         random,
         session_id,
         sni,
+        offered_alpn,
         key_shares,
         offers_tls13,
         wire_bytes_len,
         handshake_raw: handshake_raw.to_vec(),
+    })
+}
+
+fn parse_alpn_extension(ext_data: &[u8]) -> Result<Option<OfferedAlpn>, FallbackReason> {
+    let mut r = SliceReader::new(ext_data);
+    let list_len = usize::from(r.read_u16()?);
+    if list_len == 0 || list_len != r.remaining() {
+        return Err(FallbackReason::Malformed);
+    }
+
+    let mut has_h2 = false;
+    let mut has_http11 = false;
+    while !r.is_empty() {
+        let proto_len = usize::from(r.read_u8()?);
+        if proto_len == 0 {
+            return Err(FallbackReason::Malformed);
+        }
+        let proto = r.read_slice(proto_len)?;
+        if proto == b"h2" {
+            has_h2 = true;
+        } else if proto == b"http/1.1" {
+            has_http11 = true;
+        }
+    }
+
+    Ok(if has_h2 {
+        Some(OfferedAlpn::H2)
+    } else if has_http11 {
+        Some(OfferedAlpn::Http11)
+    } else {
+        None
     })
 }
 
@@ -899,7 +968,13 @@ pub fn parse_dest_server_flight(buf: &[u8]) -> ServerFlightStatus {
         encrypted_record_lens,
     };
 
-    if enc_count >= 4 {
+    // Many production TLS 1.3 stacks (Cloudflare, BoringSSL, Nginx, Go) coalesce
+    // EncryptedExtensions + Certificate + CertificateVerify + Finished into a
+    // single 0x17 record (>= 350 bytes) rather than 4 separate 0x17 records.
+    let is_coalesced_flight =
+        enc_count == 1 && encrypted_record_lens.first().copied().unwrap_or(0) >= 350;
+
+    if enc_count >= 4 || is_coalesced_flight {
         ServerFlightStatus::Complete(Box::new(profile))
     } else if enc_count >= 1 {
         ServerFlightStatus::PartialWithProfile(Box::new(profile))

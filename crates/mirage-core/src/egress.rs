@@ -62,7 +62,8 @@ impl EgressPolicy {
     }
 }
 
-/// Normalizes IPv4-mapped and NAT64 IPv6 addresses to IPv4 when applicable.
+/// Normalizes IPv4-mapped, SIIT IPv4-translated, IPv4-compatible, and NAT64 IPv6
+/// addresses to IPv4 when applicable.
 #[must_use]
 pub fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
@@ -71,7 +72,7 @@ pub fn normalize_ip(ip: IpAddr) -> IpAddr {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return IpAddr::V4(v4);
             }
-            if let Some(v4) = extract_nat64_v4(v6) {
+            if let Some(v4) = extract_embedded_v4(v6) {
                 return IpAddr::V4(v4);
             }
             IpAddr::V6(v6)
@@ -95,6 +96,42 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
             is_public_ipv6(v6)
         }
     }
+}
+
+fn extract_embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = extract_nat64_v4(v6) {
+        return Some(v4);
+    }
+    let segs = v6.segments();
+    // SIIT IPv4-translated: ::ffff:0:w.x.y.z/96 (RFC 2765)
+    let is_siit = segs.first() == Some(&0)
+        && segs.get(1) == Some(&0)
+        && segs.get(2) == Some(&0)
+        && segs.get(3) == Some(&0)
+        && segs.get(4) == Some(&0xffff)
+        && segs.get(5) == Some(&0);
+    // Deprecated IPv4-compatible: ::w.x.y.z/96 (excluding :: and ::1)
+    let is_v4_compat = !v6.is_unspecified()
+        && !v6.is_loopback()
+        && segs.first() == Some(&0)
+        && segs.get(1) == Some(&0)
+        && segs.get(2) == Some(&0)
+        && segs.get(3) == Some(&0)
+        && segs.get(4) == Some(&0)
+        && segs.get(5) == Some(&0);
+    if is_siit || is_v4_compat {
+        let hi = *segs.get(6)?;
+        let lo = *segs.get(7)?;
+        let hi_b = hi.to_be_bytes();
+        let lo_b = lo.to_be_bytes();
+        return Some(Ipv4Addr::new(
+            *hi_b.first()?,
+            *hi_b.get(1)?,
+            *lo_b.first()?,
+            *lo_b.get(1)?,
+        ));
+    }
+    None
 }
 
 fn extract_nat64_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
@@ -191,27 +228,43 @@ const fn is_public_ipv6(v6: Ipv6Addr) -> bool {
     let s0 = segs[0];
     let s1 = segs[1];
 
-    // ::/128 (unspecified) & ::1/128 (loopback)
-    if v6.is_unspecified() || v6.is_loopback() {
+    // 0000::/8 (IANA reserved by protocol, includes ::/128, ::1/128, ::/96 IPv4-compatible, and SIIT ::ffff:0:0/96)
+    if (s0 & 0xFF00) == 0x0000 {
         return false;
     }
-    // 100::/64 (discard-only)
+    // 100::/64 (discard-only, RFC 6666)
     if s0 == 0x0100 && s1 == 0 && segs[2] == 0 && segs[3] == 0 {
         return false;
     }
-    // 2001::/32 (Teredo)
+    // 2001::/32 (Teredo, RFC 4380)
     if s0 == 0x2001 && s1 == 0 {
         return false;
     }
-    // 2001:db8::/32 (documentation)
+    // 2001:2::/48 (Benchmarking, RFC 5180)
+    if s0 == 0x2001 && s1 == 0x0002 && segs[2] == 0 {
+        return false;
+    }
+    // 2001:10::/28 & 2001:20::/28 (ORCHID / ORCHIDv2, RFC 4843 / RFC 7343)
+    if s0 == 0x2001 && ((s1 & 0xFFF0) == 0x0010 || (s1 & 0xFFF0) == 0x0020) {
+        return false;
+    }
+    // 2001:db8::/32 (documentation, RFC 3849)
     if s0 == 0x2001 && s1 == 0x0db8 {
         return false;
     }
-    // 2002::/16 (6to4)
+    // 2002::/16 (6to4, RFC 3056)
     if s0 == 0x2002 {
         return false;
     }
-    // fc00::/7 (ULA)
+    // 3fff::/20 (documentation, RFC 9637)
+    if s0 == 0x3FFF && (s1 & 0xF000) == 0x0000 {
+        return false;
+    }
+    // 5f00::/16 (SRv6 SIDs, RFC 9602)
+    if s0 == 0x5F00 {
+        return false;
+    }
+    // fc00::/7 (ULA, RFC 4193)
     if (s0 & 0xFE00) == 0xFC00 {
         return false;
     }
@@ -260,14 +313,22 @@ mod tests {
             ("255.255.255.255", 443),
             ("::", 443),
             ("::1", 443),
+            ("::7f00:1", 443),
+            ("::a9fe:a9fe", 80),
+            ("::ffff:0:7f00:1", 443),
             ("::ffff:127.0.0.1", 443),
             ("::ffff:169.254.169.254", 80),
             ("64:ff9b::10.0.0.1", 443),
             ("64:ff9b:1::192.168.1.1", 443),
             ("100::1", 443),
             ("2001::1", 443),
+            ("2001:2::1", 443),
+            ("2001:10::1", 443),
+            ("2001:20::1", 443),
             ("2001:db8::1", 443),
             ("2002:0a00:0001::1", 443),
+            ("3fff::1", 443),
+            ("5f00::1", 443),
             ("fc00::1", 443),
             ("fe80::1", 443),
             ("fec0::1", 443),

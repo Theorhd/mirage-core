@@ -76,7 +76,14 @@ impl DnsResolver {
                 if guard.len() >= MAX_DNS_CACHE_ENTRIES {
                     guard.retain(|_, v| v.expires_at > now);
                     if guard.len() >= MAX_DNS_CACHE_ENTRIES {
-                        guard.clear();
+                        // Evict only the soonest-to-expire entry rather than wiping the whole cache.
+                        if let Some(oldest_key) = guard
+                            .iter()
+                            .min_by_key(|(_, v)| v.expires_at)
+                            .map(|(k, _)| k.clone())
+                        {
+                            guard.remove(&oldest_key);
+                        }
                     }
                 }
                 if let Some(expires_at) =
@@ -162,6 +169,12 @@ async fn query_single_rr(
         .ok()?
         .ok()?;
     let slice = resp.get(..n)?;
+    // Verify the echoed Question section matches our query packet (case-insensitive).
+    let expected_question = packet.get(12..)?;
+    let echoed_question = slice.get(12..packet.len())?;
+    if !echoed_question.eq_ignore_ascii_case(expected_question) {
+        return None;
+    }
     parse_dns_response(slice, tx_id)
 }
 
@@ -204,13 +217,16 @@ pub fn parse_dns_response(pkt: &[u8], expected_tx_id: u16) -> Option<(Vec<IpAddr
         return None;
     }
     let flags = u16::from_be_bytes([*pkt.get(2)?, *pkt.get(3)?]);
-    // QR must be 1 (response), RCODE (low 4 bits) must be 0 (NOERROR)
-    if (flags & 0x8000) == 0 || (flags & 0x000F) != 0 {
+    // QR must be 1 (response), TC (bit 9) must be 0 (not truncated), RCODE (low 4 bits) must be 0 (NOERROR)
+    if (flags & 0x8000) == 0 || (flags & 0x0200) != 0 || (flags & 0x000F) != 0 {
         return None;
     }
 
     let qdcount = usize::from(u16::from_be_bytes([*pkt.get(4)?, *pkt.get(5)?]));
     let ancount = usize::from(u16::from_be_bytes([*pkt.get(6)?, *pkt.get(7)?]));
+    if qdcount != 1 {
+        return None;
+    }
 
     let mut offset = 12usize;
     for _ in 0..qdcount {
@@ -271,7 +287,12 @@ fn skip_dns_name(pkt: &[u8], start: usize) -> Option<usize> {
             return idx.checked_add(1);
         }
         if (b & 0xC0) == 0xC0 {
-            // Compression pointer consumes 2 bytes at current position.
+            // Compression pointer consumes 2 bytes at current position and must point backwards >= 12.
+            let b2 = *pkt.get(idx.checked_add(1)?)?;
+            let ptr_offset = usize::from(u16::from_be_bytes([b & 0x3F, b2]));
+            if ptr_offset < 12 || ptr_offset >= idx {
+                return None;
+            }
             let next = idx.checked_add(2)?;
             return if next <= pkt.len() { Some(next) } else { None };
         }
@@ -317,5 +338,29 @@ mod tests {
             parsed,
             Some((vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))], 300))
         );
+
+        // Truncated (TC=1, 0x0200) DNS response must be rejected.
+        let mut tc_resp = resp.clone();
+        if let Some(flags) = tc_resp.get_mut(2..4) {
+            flags.copy_from_slice(&0x8380u16.to_be_bytes());
+        }
+        assert!(parse_dns_response(&tc_resp, 0x1234).is_none());
+
+        // Forward/self compression pointer (pointing to offset >= current idx) must be rejected.
+        let mut loop_resp = query;
+        if let Some(flags) = loop_resp.get_mut(2..4) {
+            flags.copy_from_slice(&0x8180u16.to_be_bytes());
+        }
+        if let Some(ancount) = loop_resp.get_mut(6..8) {
+            ancount.copy_from_slice(&1u16.to_be_bytes());
+        }
+        let self_offset = u16::try_from(loop_resp.len()).unwrap_or(0);
+        loop_resp.extend_from_slice(&(0xC000u16 | self_offset).to_be_bytes());
+        loop_resp.extend_from_slice(&1u16.to_be_bytes());
+        loop_resp.extend_from_slice(&1u16.to_be_bytes());
+        loop_resp.extend_from_slice(&60u32.to_be_bytes());
+        loop_resp.extend_from_slice(&4u16.to_be_bytes());
+        loop_resp.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(parse_dns_response(&loop_resp, 0x1234).is_none());
     }
 }

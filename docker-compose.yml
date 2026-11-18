@@ -1,8 +1,6 @@
 services:
   miraged:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/theorhd/mirage-core:latest
     user: "65534:65534"
     read_only: true
     cap_drop:

@@ -247,6 +247,12 @@ pub fn encode_mux_frame_into(frame: &MuxFrame, out: &mut Vec<u8>) -> Result<(), 
     out.push(opt);
 
     if let Some(target) = &frame.target {
+        if matches!(frame.status, MuxStatus::End | MuxStatus::KeepAlive) {
+            return Err(MuxError::InvalidMetadataLen);
+        }
+        if frame.status == MuxStatus::Keep && target.network != MuxNetwork::Udp {
+            return Err(MuxError::InvalidNetwork);
+        }
         out.push(target.network.to_u8());
         out.extend_from_slice(&target.port.to_be_bytes());
         match &target.address {
@@ -313,10 +319,13 @@ pub fn encode_mux_frame(frame: &MuxFrame) -> Result<Zeroizing<Vec<u8>>, MuxError
 fn parse_target_and_gid(
     meta: &[u8],
     start: usize,
-    require_exact_for_tcp: bool,
+    allow_tcp: bool,
 ) -> Result<(MuxTarget, Option<[u8; 8]>), MuxError> {
     let net_byte = *meta.get(start).ok_or(MuxError::InvalidMetadataLen)?;
     let network = MuxNetwork::from_u8(net_byte).ok_or(MuxError::InvalidNetwork)?;
+    if !allow_tcp && network == MuxNetwork::Tcp {
+        return Err(MuxError::InvalidNetwork);
+    }
 
     let p_off = start.saturating_add(1);
     let p_end = p_off.saturating_add(2);
@@ -376,9 +385,6 @@ fn parse_target_and_gid(
             let mut gid = [0u8; 8];
             gid.copy_from_slice(gid_slice);
             Some(gid)
-        }
-        (MuxNetwork::Tcp, _) if require_exact_for_tcp => {
-            return Err(MuxError::InvalidMetadataLen);
         }
         _ => return Err(MuxError::InvalidMetadataLen),
     };
@@ -528,6 +534,30 @@ mod tests {
         assert_eq!(
             decode_mux_frame(&[0x00, 0x04, 0x00, 0x01, 0x99, 0x00]),
             Err(MuxError::InvalidStatus)
+        );
+        // Keep frame with TCP target override (0x01) is invalid (only UDP 0x02 allowed)
+        assert_eq!(
+            decode_mux_frame(&[
+                0x00, 0x0C, 0x00, 0x01, 0x02, 0x00, 0x01, 0x01, 0xBB, 0x01, 1, 1, 1, 1
+            ]),
+            Err(MuxError::InvalidNetwork)
+        );
+        let invalid_keep_tcp = MuxFrame {
+            id: 1,
+            status: MuxStatus::Keep,
+            opt_data: false,
+            opt_error: false,
+            target: Some(MuxTarget {
+                network: MuxNetwork::Tcp,
+                port: 443,
+                address: VlessAddress::Ipv4(Ipv4Addr::new(1, 1, 1, 1)),
+            }),
+            global_id: None,
+            payload: Zeroizing::new(Vec::new()),
+        };
+        assert_eq!(
+            encode_mux_frame(&invalid_keep_tcp),
+            Err(MuxError::InvalidNetwork)
         );
     }
 }

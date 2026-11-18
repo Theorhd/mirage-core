@@ -1,0 +1,14 @@
+# Exclude build artifacts, version control, and local secrets from Docker build context
+/target
+/fuzz
+/docs
+/.git
+/.github
+/.mirage-local
+/secrets
+config.toml
+*.local.toml
+*.env
+*.key
+*.pem
+start.sh
