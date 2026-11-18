@@ -1,0 +1,22 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+*.pdb
+
+# Sensitive configuration & environment files
+config.toml
+*.local.toml
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# OS & editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
