@@ -75,6 +75,7 @@ mirage-core/
 │       ├── Cargo.toml
 │       └── src/
 │           └── main.rs         # CLI, TOML configuration, socket accept loop, tracing
+├── SECURITY.md                 # Vulnerability disclosure policy
 └── README.md
 ```
 
@@ -100,32 +101,39 @@ mirage-core/
 
 1. **Sans-I/O Isolation**: Separating state machines and cryptographic verification from socket I/O minimizes attack surface, avoids hidden state coupling, and enables thorough fuzzing and boundary testing on raw byte inputs.
 2. **Non-Destructive TCP Interception**: The initial `ClientHello` is never delegated to `rustls` or `tokio-rustls`. Keeping the original TCP payload intact inside `BytesMut` guarantees that fallback relays reproduce the exact client bytes when forwarding to `dest`.
-3. **Replay & Probe Resistance**: Reality Session ID verification validates both the AEAD authentication tag (derived via X25519 + HKDF-SHA256) and a strict timestamp/ShortID window, mitigating replay attacks and passive/active probing.
-4. **Hardened Container Runtime (`FROM scratch`)**:
+3. **Replay & Probe Resistance**: Reality Session ID verification validates both the AEAD authentication tag (derived via X25519 + HKDF-SHA256) and a strict timestamp/ShortID window, backed by a bounded, fail-closed in-memory anti-replay cache.
+4. **Never Close, Always Delegate**: Timeouts, oversized or malformed input, unknown SNIs, failed authentication, and replays are all relayed to `dest` instead of being closed locally, so the server's behavior never diverges from the legitimate destination.
+5. **Panic-Free Parsing**: With `panic = "abort"`, any panic reachable from network input would be a remote DoS. Parsers are written without `unwrap`/indexing/unchecked arithmetic (enforced by denied clippy lints and `overflow-checks`) and continuously fuzzed.
+6. **Zero-Log Privacy**: No client IPs, SNIs, credentials, destinations, or per-session metrics are logged; errors and panics are sanitized; no state, logs, or core dumps ever touch disk.
+7. **Hardened Container Runtime (`FROM scratch`)**:
    * Multi-stage static compilation against `musl` with stripped debug symbols.
    * Runtime image contains only the static binary—no libc dynamic loader, no shell (`/bin/sh`), and no package manager.
-   * Executed as an unprivileged user (`UID 65534`), with a read-only root filesystem (`read_only: true`) and all Linux capabilities dropped (`cap_drop: [ALL]`).
+   * Executed as an unprivileged user (`UID 65534`), with a read-only root filesystem (`read_only: true`), all Linux capabilities dropped (`cap_drop: [ALL]`), a dedicated seccomp profile, no container log persistence, and core dumps disabled.
+
+Found a vulnerability? Please follow [SECURITY.md](SECURITY.md) — never open a public issue.
 
 ---
 
 ## Roadmap
 
 * [ ] **Milestone 1 — SNI Proxy & TCP Fallback**
-  * Async TCP listener in `miraged` with `BytesMut` initial-packet buffering.
-  * Non-destructive TLS `ClientHello` parsing (`SNI`, `Session ID`, `key_share`) in `mirage-core::tls_parser`.
-  * Transparent bidirectional TCP fallback (`tokio::io::copy_bidirectional`) to `dest`.
+  * Async TCP listener in `miraged` with `BytesMut` initial-packet buffering and accept-side backpressure.
+  * Non-destructive TLS `ClientHello` parsing (`SNI`, `Session ID`, `key_share` incl. hybrid `X25519MLKEM768`) with multi-segment / multi-record reassembly in `mirage-core::tls_parser`.
+  * Transparent bidirectional TCP fallback (`tokio::io::copy_bidirectional`) to `dest`, applying the "never close, always delegate" rule.
+  * Panic-free lint set, fuzz harness, and differential probing harness (`miraged` vs `dest`).
 * [ ] **Milestone 2 — Reality Cryptographic Handshake**
   * X25519 ECDH key agreement, HKDF-SHA256 key derivation, and AEAD verification (`crypto.rs`).
-  * Session ID decryption, `ShortID` matching, and anti-replay timestamp checks (`reality.rs`).
-  * Completion of the authenticated Reality TLS 1.3 handshake flow.
+  * Session ID decryption, constant-time `ShortID` matching, timestamp window, and fail-closed anti-replay cache (`reality.rs`).
+  * Completion of the authenticated Reality TLS 1.3 handshake flow, mimicking the `dest` handshake profile and preferring `X25519MLKEM768`.
 * [ ] **Milestone 3 — VLESS Protocol & XTLS-Vision**
   * Binary VLESS request/response framing (version, UUID authentication, addons, TCP/UDP commands) in `vless.rs`.
   * XTLS-Vision TLS-in-TLS padding and inner Application Data detection (`vision.rs`).
-  * Full upstream TCP/UDP proxying.
+  * Full upstream TCP/UDP proxying with anti-SSRF egress policy on resolved IPs and private DNS resolution.
 * [ ] **Milestone 4 — Packaging & Hardening**
-  * TOML configuration loading and CLI keypair / ShortID / UUID generation utilities.
+  * Zeroizing TOML configuration loading, key rotation with hot reload, and CLI keypair / ShortID / UUID generation utilities.
   * Multi-stage `Dockerfile` targeting `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` onto `FROM scratch`.
-  * Hardened `docker-compose.yml` (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `UID 65534`).
+  * Hardened `docker-compose.yml` (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `UID 65534`, seccomp, `logging: none`, no core dumps, no swap).
+  * Supply-chain pipeline: `cargo-audit`, `cargo-deny`, `cargo-vet`, reproducible builds, SBOM, signed images.
 
 ---
 
