@@ -1,0 +1,59 @@
+# mirage-core (miraged) configuration template
+#
+# Permissions on host (outside Swarm):
+#   install -d -m 0700 ./secrets
+#   install -m 0400 -o 65534 -g 65534 config.example.toml ./secrets/config.toml
+#
+# Generate credentials without touching disk:
+#   docker run --rm mirage-core keygen
+
+# Bind an unprivileged port inside the container; publish 443 -> 8443 in Docker.
+listen_addr = "0.0.0.0:8443"
+
+# Pinned legitimate TLS 1.3 camouflage destination (`dest`).
+# Prefer a site in the same ASN / low RTT from the VPS, or a self-steal site.
+dest_addr = "203.0.113.10:443"
+
+# Exact ASCII case-insensitive SNI allowlist (wildcards forbidden).
+server_names = ["example.com", "www.example.com"]
+
+# Handshake inspection budget and timeouts.
+max_client_hello_bytes = 16384
+initial_read_timeout_ms = 3000
+max_connections = 4096
+
+# Strict Zero-PII logging by default. NEVER enable in production.
+unsafe_debug_logging = false
+
+[reality]
+# List of X25519 private keys (43-char Base64url or 64-char hex).
+# Put [current, previous] during key rotation grace periods, then SIGHUP reload.
+private_keys = [
+    "REPLACE_WITH_BASE64URL_OR_HEX_PRIVATE_KEY",
+]
+
+# Non-empty hex ShortIDs (2..=16 hex chars, one per user/device).
+short_ids = [
+    "0123456789abcdef",
+]
+
+# Replay protection window (seconds; host must run authenticated NTP/NTS).
+max_time_diff_secs = 60
+replay_cache_capacity = 65536
+
+# Optional inclusive client version bounds [major, minor, patch].
+# min_client_ver = [1, 8, 0]
+
+[vless]
+# Authorized client UUIDv4 values (one per user/device).
+uuids = [
+    "00000000-0000-4000-8000-000000000000",
+]
+
+# Anti-SSRF defaults (keep both false in production).
+allow_private_egress = false
+allow_smtp_port_25 = false
+
+# Local recursive DNS resolver (e.g. sibling `unbound` container, zero ECS).
+dns_resolver = "127.0.0.1:5353"
+allow_system_dns = false

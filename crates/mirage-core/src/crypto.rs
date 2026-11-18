@@ -67,6 +67,39 @@ impl StaticPrivateKey {
         Ok(Self::from_bytes(*raw))
     }
 
+    /// Parses a 43-character unpadded (or 44-character `=`-padded) Base64url
+    /// X25519 private key (standard Xray-core format) without leaving
+    /// un-zeroized copies behind.
+    pub fn from_base64url(b64: &str) -> Result<Self, CryptoError> {
+        let mut raw = Zeroizing::new([0u8; 32]);
+        decode_base64url_32(b64, &mut raw)?;
+        Ok(Self::from_bytes(*raw))
+    }
+
+    /// Parses either 64-character hexadecimal or Base64url (Xray-core) encoding.
+    pub fn from_encoded(encoded: &str) -> Result<Self, CryptoError> {
+        let trimmed = encoded.trim();
+        if trimmed.len() == 64 {
+            Self::from_hex(trimmed)
+        } else {
+            Self::from_base64url(trimmed)
+        }
+    }
+
+    /// Encodes the raw private key bytes as unpadded Base64url inside a
+    /// `Zeroizing<String>` (for `keygen` CLI output).
+    #[must_use]
+    pub fn to_base64url(&self) -> Zeroizing<String> {
+        Zeroizing::new(encode_base64url(self.bytes.as_slice()))
+    }
+
+    /// Encodes the raw private key bytes as lowercase hexadecimal inside a
+    /// `Zeroizing<String>` (for `keygen` CLI output).
+    #[must_use]
+    pub fn to_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(encode_hex(self.bytes.as_slice()))
+    }
+
     /// Returns the corresponding 32-byte X25519 public key.
     #[must_use]
     pub fn public_key(&self) -> [u8; 32] {
@@ -943,6 +976,113 @@ const fn hex_nibble(b: u8) -> Result<u8, CryptoError> {
     }
 }
 
+/// Encodes arbitrary bytes as lowercase hexadecimal.
+#[must_use]
+pub fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &b in bytes {
+        let hi = usize::from(b >> 4);
+        let lo = usize::from(b & 0x0F);
+        if let (Some(&hc), Some(&lc)) = (HEX.get(hi), HEX.get(lo)) {
+            out.push(char::from(hc));
+            out.push(char::from(lc));
+        }
+    }
+    out
+}
+
+/// Encodes arbitrary bytes as unpadded Base64url (RFC 4648 §5, Xray-core format).
+#[must_use]
+pub fn encode_base64url(bytes: &[u8]) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    for chunk in bytes.chunks(3) {
+        let b0 = *chunk.first().unwrap_or(&0);
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+
+        let i0 = usize::from(b0 >> 2);
+        let i1 = usize::from(((b0 & 0x03) << 4) | (b1 >> 4));
+        let i2 = usize::from(((b1 & 0x0F) << 2) | (b2 >> 6));
+        let i3 = usize::from(b2 & 0x3F);
+
+        if let Some(&c0) = B64.get(i0) {
+            out.push(char::from(c0));
+        }
+        if let Some(&c1) = B64.get(i1) {
+            out.push(char::from(c1));
+        }
+        if chunk.len() >= 2 {
+            if let Some(&c2) = B64.get(i2) {
+                out.push(char::from(c2));
+            }
+        }
+        if chunk.len() == 3 {
+            if let Some(&c3) = B64.get(i3) {
+                out.push(char::from(c3));
+            }
+        }
+    }
+    out
+}
+
+fn decode_base64url_32(input: &str, out: &mut [u8; 32]) -> Result<(), CryptoError> {
+    let trimmed = input.trim();
+    let unpadded = trimmed.strip_suffix('=').unwrap_or(trimmed);
+    if unpadded.len() != 43 {
+        return Err(CryptoError::InvalidEncoding);
+    }
+
+    let chars = unpadded.as_bytes();
+    let mut dst_idx = 0usize;
+
+    for block in chars.chunks_exact(4) {
+        let v0 = b64url_val(*block.first().ok_or(CryptoError::InvalidEncoding)?)?;
+        let v1 = b64url_val(*block.get(1).ok_or(CryptoError::InvalidEncoding)?)?;
+        let v2 = b64url_val(*block.get(2).ok_or(CryptoError::InvalidEncoding)?)?;
+        let v3 = b64url_val(*block.get(3).ok_or(CryptoError::InvalidEncoding)?)?;
+
+        if let Some(s) = out.get_mut(dst_idx) {
+            *s = (v0 << 2) | (v1 >> 4);
+        }
+        if let Some(s) = out.get_mut(dst_idx.saturating_add(1)) {
+            *s = (v1 << 4) | (v2 >> 2);
+        }
+        if let Some(s) = out.get_mut(dst_idx.saturating_add(2)) {
+            *s = (v2 << 6) | v3;
+        }
+        dst_idx = dst_idx.saturating_add(3);
+    }
+
+    // Trailing 3 chars (30..32 bytes: 18 bits -> 16 data bits + 2 zero padding bits)
+    let rem = chars.get(40..43).ok_or(CryptoError::InvalidEncoding)?;
+    let v0 = b64url_val(*rem.first().ok_or(CryptoError::InvalidEncoding)?)?;
+    let v1 = b64url_val(*rem.get(1).ok_or(CryptoError::InvalidEncoding)?)?;
+    let v2 = b64url_val(*rem.get(2).ok_or(CryptoError::InvalidEncoding)?)?;
+    if (v2 & 0x03) != 0 {
+        return Err(CryptoError::InvalidEncoding);
+    }
+    if let Some(s) = out.get_mut(30) {
+        *s = (v0 << 2) | (v1 >> 4);
+    }
+    if let Some(s) = out.get_mut(31) {
+        *s = (v1 << 4) | (v2 >> 2);
+    }
+    Ok(())
+}
+
+const fn b64url_val(b: u8) -> Result<u8, CryptoError> {
+    match b {
+        b'A'..=b'Z' => Ok(b.saturating_sub(b'A')),
+        b'a'..=b'z' => Ok(b.saturating_sub(b'a').saturating_add(26)),
+        b'0'..=b'9' => Ok(b.saturating_sub(b'0').saturating_add(52)),
+        b'-' => Ok(62),
+        b'_' => Ok(63),
+        _ => Err(CryptoError::InvalidEncoding),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1054,5 +1194,33 @@ mod tests {
         assert_eq!(rec.len(), 128);
         let opened = reader.open_record(&rec);
         assert_eq!(opened, Ok((0x16, b"hello reality".to_vec())));
+    }
+
+    #[test]
+    fn base64url_and_hex_private_key_roundtrip() {
+        let raw = [0x42u8; 32];
+        let key = StaticPrivateKey::from_bytes(raw);
+        let b64 = key.to_base64url();
+        let hex = key.to_hex();
+        assert_eq!(b64.len(), 43);
+        assert_eq!(hex.len(), 64);
+
+        let from_b64 = StaticPrivateKey::from_encoded(&b64);
+        let from_hex = StaticPrivateKey::from_encoded(&hex);
+        assert!(from_b64.is_ok());
+        assert!(from_hex.is_ok());
+        if let (Ok(k1), Ok(k2)) = (from_b64, from_hex) {
+            assert_eq!(k1.public_key(), key.public_key());
+            assert_eq!(k2.public_key(), key.public_key());
+        }
+
+        // Non-canonical trailing bits in 43rd Base64url char must be rejected.
+        let mut bad_b64 = (*b64).clone();
+        bad_b64.pop();
+        bad_b64.push('B');
+        assert_eq!(
+            StaticPrivateKey::from_base64url(&bad_b64).err(),
+            Some(CryptoError::InvalidEncoding)
+        );
     }
 }

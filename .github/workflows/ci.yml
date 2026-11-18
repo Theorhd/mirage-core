@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  check-and-test:
+    name: Format, Clippy & Workspace Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Rust toolchain (pinned in rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@e92b0b34131c6449770e07d50f1606b823397824 # master
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy with strict workspace lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run workspace unit and integration tests
+        run: cargo test --workspace --locked
+
+  supply-chain:
+    name: Supply Chain (cargo-deny & cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@e92b0b34131c6449770e07d50f1606b823397824 # master
+
+      - name: Check licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@69f6127c7a0b6088062be3a871b2358c5efadff8 # v2
+
+      - name: Audit Cargo.lock against RustSec advisories
+        uses: rustsec/audit-check@1f4b035df3bc3472d9f5e6e07f62c01f07919449 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -5,7 +5,7 @@
 use core::future::Future;
 use core::net::{IpAddr, SocketAddr};
 use core::time::Duration;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
@@ -59,6 +59,104 @@ const RELAY_CHUNK_SIZE: usize = 8192;
 /// `ServerHello` has already arrived.
 const DEST_TRAILING_RECORD_WAIT: Duration = Duration::from_millis(40);
 
+/// Snapshot of reloadable runtime configuration and RAM-only caches.
+pub struct ReloadableState {
+    config: Config,
+    replay_cache: Option<Arc<Mutex<ReplayCache>>>,
+    dns_resolver: Option<Arc<DnsResolver>>,
+}
+
+/// Thread-safe, hot-reloadable runtime state swapped atomically on `SIGHUP`.
+///
+/// Existing connections keep their already-acquired `Config`/`ReplayCache`/`DnsResolver`
+/// handles without interruption while rotated-out secrets are dropped and zeroized.
+pub struct SharedRuntime {
+    hmac_key: Zeroizing<[u8; 32]>,
+    state: RwLock<Arc<ReloadableState>>,
+}
+
+impl SharedRuntime {
+    /// Initializes reloadable state from an initial validated `Config`.
+    pub fn new(config: Config) -> Result<Arc<Self>, DaemonError> {
+        let mut hmac_key = Zeroizing::new([0u8; 32]);
+        getrandom::fill(hmac_key.as_mut_slice()).map_err(|_| DaemonError::HardeningFailed)?;
+
+        let replay_cache = config.reality().map(|rc| {
+            Arc::new(Mutex::new(ReplayCache::new(
+                *hmac_key,
+                rc.max_time_diff_secs(),
+                rc.replay_cache_capacity(),
+            )))
+        });
+        let dns_resolver = config
+            .vless()
+            .map(|vc| Arc::new(DnsResolver::new(vc.dns_resolver(), vc.allow_system_dns())));
+
+        Ok(Arc::new(Self {
+            hmac_key,
+            state: RwLock::new(Arc::new(ReloadableState {
+                config,
+                replay_cache,
+                dns_resolver,
+            })),
+        }))
+    }
+
+    /// Returns a cheap `Arc` snapshot of the current active configuration and caches.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<ReloadableState> {
+        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&guard)
+    }
+
+    /// Atomically swaps in a newly validated `Config` (zeroizing dropped secrets).
+    ///
+    /// Preserves the active `ReplayCache` when `max_time_diff_secs` and
+    /// `replay_cache_capacity` are unchanged so key rotation never clears replay history.
+    pub fn reload(&self, new_config: Config) -> Result<(), DaemonError> {
+        let old = self.snapshot();
+        if new_config.listen_addr() != old.config.listen_addr() {
+            return Err(DaemonError::ConfigInvalid);
+        }
+
+        let replay_cache = match (
+            new_config.reality(),
+            old.config.reality(),
+            &old.replay_cache,
+        ) {
+            (Some(new_rc), Some(old_rc), Some(existing))
+                if new_rc.max_time_diff_secs() == old_rc.max_time_diff_secs()
+                    && new_rc.replay_cache_capacity() == old_rc.replay_cache_capacity() =>
+            {
+                Some(Arc::clone(existing))
+            }
+            (Some(new_rc), _, _) => Some(Arc::new(Mutex::new(ReplayCache::new(
+                *self.hmac_key,
+                new_rc.max_time_diff_secs(),
+                new_rc.replay_cache_capacity(),
+            )))),
+            (None, _, _) => None,
+        };
+
+        let dns_resolver = new_config
+            .vless()
+            .map(|vc| Arc::new(DnsResolver::new(vc.dns_resolver(), vc.allow_system_dns())));
+
+        let next_state = Arc::new(ReloadableState {
+            config: new_config,
+            replay_cache,
+            dns_resolver,
+        });
+
+        let previous = {
+            let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
+            core::mem::replace(&mut *guard, next_state)
+        };
+        drop(previous);
+        Ok(())
+    }
+}
+
 /// Runs the TCP accept loop until `shutdown` resolves.
 ///
 /// Enforces global connection budgets via **accept-side backpressure**: a
@@ -73,24 +171,26 @@ pub async fn run_server<F>(
 where
     F: Future<Output = ()>,
 {
-    let mut hmac_key = Zeroizing::new([0u8; 32]);
+    let runtime = SharedRuntime::new((*config).clone())?;
+    run_server_with_reload(listener, runtime, metrics, shutdown).await
+}
+
+/// Runs the TCP accept loop backed by a hot-reloadable [`SharedRuntime`].
+pub async fn run_server_with_reload<F>(
+    listener: TcpListener,
+    runtime: Arc<SharedRuntime>,
+    metrics: Arc<Metrics>,
+    shutdown: F,
+) -> Result<(), DaemonError>
+where
+    F: Future<Output = ()>,
+{
     let mut cert_seed = Zeroizing::new([0u8; 32]);
-    getrandom::fill(hmac_key.as_mut_slice()).map_err(|_| DaemonError::HardeningFailed)?;
     getrandom::fill(cert_seed.as_mut_slice()).map_err(|_| DaemonError::HardeningFailed)?;
 
     let cert_template = Arc::new(RealityCertTemplate::from_seed(*cert_seed));
-    let replay_cache = config.reality().map(|rc| {
-        Arc::new(Mutex::new(ReplayCache::new(
-            *hmac_key,
-            rc.max_time_diff_secs(),
-            rc.replay_cache_capacity(),
-        )))
-    });
-    let dns_resolver = config
-        .vless()
-        .map(|vc| Arc::new(DnsResolver::new(vc.dns_resolver(), vc.allow_system_dns())));
-
-    let semaphore = Arc::new(Semaphore::new(config.max_connections()));
+    let initial_max_conns = runtime.snapshot().config.max_connections();
+    let semaphore = Arc::new(Semaphore::new(initial_max_conns));
     tokio::pin!(shutdown);
 
     loop {
@@ -114,13 +214,12 @@ where
         match accept_res {
             Ok((stream, _peer_addr)) => {
                 metrics.inc_accepted();
-                tokio::spawn(handle_connection(
+                let snap = runtime.snapshot();
+                tokio::spawn(handle_connection_state(
                     stream,
-                    Arc::clone(&config),
+                    snap,
                     Arc::clone(&metrics),
                     Arc::clone(&cert_template),
-                    replay_cache.as_ref().map(Arc::clone),
-                    dns_resolver.as_ref().map(Arc::clone),
                     permit,
                 ));
             }
@@ -134,9 +233,28 @@ where
     Ok(())
 }
 
+async fn handle_connection_state(
+    client: TcpStream,
+    state: Arc<ReloadableState>,
+    metrics: Arc<Metrics>,
+    cert_template: Arc<RealityCertTemplate>,
+    permit: OwnedSemaphorePermit,
+) {
+    handle_connection(
+        client,
+        &state.config,
+        metrics,
+        cert_template,
+        state.replay_cache.as_ref().map(Arc::clone),
+        state.dns_resolver.as_ref().map(Arc::clone),
+        permit,
+    )
+    .await;
+}
+
 async fn handle_connection(
     mut client: TcpStream,
-    config: Arc<Config>,
+    config: &Config,
     metrics: Arc<Metrics>,
     cert_template: Arc<RealityCertTemplate>,
     replay_cache: Option<Arc<Mutex<ReplayCache>>>,
@@ -158,7 +276,7 @@ async fn handle_connection(
             &mut client_eof,
             &mut client_io_err,
             &mut matched_hello,
-            &config,
+            config,
             &metrics,
         ),
     )
@@ -195,7 +313,7 @@ async fn handle_connection(
                         buf,
                         *ch,
                         *auth,
-                        &config,
+                        config,
                         &cert_template,
                         dns_resolver.as_deref(),
                         &metrics,
@@ -998,4 +1116,93 @@ async fn delegate_to_dest(
     }
 
     let _ = tokio::io::copy_bidirectional(&mut client, &mut dest).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RealityConfig;
+    use mirage_core::crypto::{ShortId, StaticPrivateKey};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn test_config(
+        listen_port: u16,
+        key_seed: u8,
+        short_id_seed: u8,
+        max_time_diff_secs: u64,
+        replay_cache_capacity: usize,
+    ) -> Result<Config, DaemonError> {
+        let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
+        let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        let cfg = Config::new(
+            listen,
+            dest,
+            vec!["example.com".to_owned()],
+            16 * 1024,
+            5000,
+            64,
+            false,
+        )?;
+        let key = StaticPrivateKey::from_bytes([key_seed; 32]);
+        let short_id = ShortId::from_bytes([short_id_seed; 8]);
+        let reality = RealityConfig::new(
+            vec![key],
+            vec![short_id],
+            max_time_diff_secs,
+            replay_cache_capacity,
+            None,
+            None,
+        )?;
+        cfg.with_reality(reality)
+    }
+
+    #[test]
+    fn shared_runtime_hot_reload_swaps_keys_and_preserves_replay_cache() -> Result<(), DaemonError>
+    {
+        let initial = test_config(8443, 0x11, 0xAA, 120, 1024)?;
+        let runtime = SharedRuntime::new(initial)?;
+        let snap1 = runtime.snapshot();
+        let cache1 = snap1
+            .replay_cache
+            .as_ref()
+            .ok_or(DaemonError::ConfigInvalid)?;
+
+        // Rotate private key & short_id while keeping replay window/capacity identical.
+        let rotated = test_config(8443, 0x22, 0xBB, 120, 1024)?;
+        runtime.reload(rotated)?;
+
+        let snap2 = runtime.snapshot();
+        let cache2 = snap2
+            .replay_cache
+            .as_ref()
+            .ok_or(DaemonError::ConfigInvalid)?;
+
+        assert!(Arc::ptr_eq(cache1, cache2));
+        let key2 = snap2
+            .config
+            .reality()
+            .and_then(|r| r.private_keys().first())
+            .ok_or(DaemonError::ConfigInvalid)?;
+        assert_eq!(
+            key2.to_hex(),
+            StaticPrivateKey::from_bytes([0x22; 32]).to_hex()
+        );
+
+        // Changing replay cache window/capacity allocates a fresh cache.
+        let resized = test_config(8443, 0x33, 0xCC, 180, 2048)?;
+        runtime.reload(resized)?;
+        let snap3 = runtime.snapshot();
+        let cache3 = snap3
+            .replay_cache
+            .as_ref()
+            .ok_or(DaemonError::ConfigInvalid)?;
+        assert!(!Arc::ptr_eq(cache2, cache3));
+
+        // Changing listen_addr at runtime must fail-closed and keep snap3 intact.
+        let changed_listen = test_config(9443, 0x44, 0xDD, 180, 2048)?;
+        assert!(runtime.reload(changed_listen).is_err());
+        assert_eq!(runtime.snapshot().config.listen_addr().port(), 8443);
+
+        Ok(())
+    }
 }
