@@ -74,6 +74,7 @@ mirage-core/
 │   │       ├── reality.rs      # Reality handshake state machine (Auth vs Fallback)
 │   │       ├── vless.rs        # Binary VLESS codec (Version, UUID, Addons, TCP/UDP commands)
 │   │       ├── vision.rs       # XTLS-Vision (TLS-in-TLS padding & Application Data detection)
+│   │       ├── mux.rs          # Mux.Cool (v1.mux.cool) & XUDP binary frame codec
 │   │       └── egress.rs       # Fail-closed anti-SSRF egress IP/port policy
 │   └── miraged/                # Tokio asynchronous server binary
 │       ├── Cargo.toml
@@ -83,6 +84,8 @@ mirage-core/
 │           ├── config.rs       # Zeroizing TOML parser & validation (Hex + Base64url keys)
 │           ├── keygen.rs       # X25519 keypair, ShortID & UUIDv4 CLI generator (getrandom)
 │           ├── proxy.rs        # Accept loop, BytesMut peeking, SharedRuntime, Reality/Vision relay
+│           ├── mux.rs          # Mux.Cool TCP multiplexer & XUDP Full-Cone NAT table
+│           ├── outbound.rs     # Anti-SSRF multi-IP resolution & Happy Eyeballs dialing
 │           ├── dns.rs          # Private RFC 1035 DNS-over-UDP/TCP resolver
 │           ├── hardening.rs    # Core-dump disable, rlimit & privilege drop helpers
 │           ├── metrics.rs      # Lock-free, PII-free atomic counters

@@ -18,6 +18,10 @@ pub struct Metrics {
     reality_handshake_completed: AtomicU64,
     vless_tcp_sessions: AtomicU64,
     vless_udp_sessions: AtomicU64,
+    vless_mux_sessions: AtomicU64,
+    mux_substreams: AtomicU64,
+    xudp_packets: AtomicU64,
+    idle_timeouts: AtomicU64,
     vless_auth_failed: AtomicU64,
     egress_blocked: AtomicU64,
     vision_direct_switches: AtomicU64,
@@ -83,6 +87,22 @@ impl Metrics {
 
     pub fn inc_vless_udp_sessions(&self) {
         self.vless_udp_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_vless_mux_sessions(&self) {
+        self.vless_mux_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_mux_substreams(&self) {
+        self.mux_substreams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_xudp_packets(&self) {
+        self.xudp_packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_idle_timeouts(&self) {
+        self.idle_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_vless_auth_failed(&self) {
@@ -160,6 +180,26 @@ impl Metrics {
     #[must_use]
     pub fn vless_udp_sessions(&self) -> u64 {
         self.vless_udp_sessions.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn vless_mux_sessions(&self) -> u64 {
+        self.vless_mux_sessions.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn mux_substreams(&self) -> u64 {
+        self.mux_substreams.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn xudp_packets(&self) -> u64 {
+        self.xudp_packets.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn idle_timeouts(&self) -> u64 {
+        self.idle_timeouts.load(Ordering::Relaxed)
     }
 
     #[must_use]

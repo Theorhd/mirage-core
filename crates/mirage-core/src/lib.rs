@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod crypto;
 pub mod egress;
+pub mod mux;
 pub mod reality;
 pub mod tls_parser;
 pub mod vision;

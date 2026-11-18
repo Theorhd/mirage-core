@@ -19,7 +19,10 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::tls_parser::{KeyShares, SelectedGroup, Tls13CipherSuiteId};
+use crate::tls_parser::{
+    KeyShares, SelectedGroup, Tls13CipherSuiteId, MAX_TLS_CIPHERTEXT_RECORD_LEN,
+    MAX_TLS_RECORD_FRAGMENT,
+};
 
 /// Errors produced by cryptographic primitives (no secrets embedded).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,14 +51,20 @@ pub enum CryptoError {
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct StaticPrivateKey {
     bytes: Box<[u8; 32]>,
+    #[zeroize(skip)]
+    secret: Box<X25519StaticSecret>,
 }
 
 impl StaticPrivateKey {
     /// Constructs a `StaticPrivateKey` from raw 32-byte scalar material.
     #[must_use]
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub fn from_bytes(mut bytes: [u8; 32]) -> Self {
+        let secret = Box::new(X25519StaticSecret::from(bytes));
+        let boxed_bytes = Box::new(bytes);
+        bytes.zeroize();
         Self {
-            bytes: Box::new(bytes),
+            bytes: boxed_bytes,
+            secret,
         }
     }
 
@@ -103,16 +112,14 @@ impl StaticPrivateKey {
     /// Returns the corresponding 32-byte X25519 public key.
     #[must_use]
     pub fn public_key(&self) -> [u8; 32] {
-        let secret = X25519StaticSecret::from(*self.bytes);
-        X25519PublicKey::from(&secret).to_bytes()
+        X25519PublicKey::from(&*self.secret).to_bytes()
     }
 
     /// Performs X25519 ECDH against a client's 32-byte ephemeral public key,
     /// rejecting non-contributory (all-zero) outputs.
     pub fn diffie_hellman(&self, peer_pub: &[u8; 32]) -> Result<SharedSecret, CryptoError> {
-        let secret = X25519StaticSecret::from(*self.bytes);
         let peer = X25519PublicKey::from(*peer_pub);
-        let shared = secret.diffie_hellman(&peer);
+        let shared = self.secret.diffie_hellman(&peer);
         if !shared.was_contributory() {
             return Err(CryptoError::NonContributorySharedSecret);
         }
@@ -364,8 +371,9 @@ impl RealityCertTemplate {
     /// Builds a self-signed X.509 v3 Ed25519 DER certificate template from a
     /// 32-byte CSPRNG seed.
     #[must_use]
-    pub fn from_seed(seed: [u8; 32]) -> Self {
+    pub fn from_seed(mut seed: [u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(&seed);
+        seed.zeroize();
         let verifying_key_bytes = signing_key.verifying_key().to_bytes();
         let cert_der_template = build_ed25519_x509_template(&signing_key, &verifying_key_bytes);
         Self {
@@ -785,15 +793,19 @@ impl fmt::Debug for Tls13RecordCipher {
 }
 
 impl Tls13RecordCipher {
-    /// Encrypts a TLS 1.3 record, optionally zero-padding the inner plaintext so
-    /// the resulting TLS wire record length equals `target_wire_len` (when `target_wire_len`
-    /// is at least as large as the unpadded wire length).
-    pub fn seal_record(
+    /// Encrypts a TLS 1.3 record into a reusable buffer `record`, clearing any
+    /// previous contents while preserving existing capacity.
+    pub fn seal_record_into(
         &mut self,
         inner_content_type: u8,
         plaintext: &[u8],
         target_wire_len: Option<usize>,
-    ) -> Result<Vec<u8>, CryptoError> {
+        record: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        record.clear();
+        if plaintext.len() > MAX_TLS_RECORD_FRAGMENT {
+            return Err(CryptoError::InvalidRecord);
+        }
         // Unpadded inner plaintext = plaintext.len() + 1 (content_type)
         // Overhead = 16 (GCM/Poly1305 tag), header = 5 bytes
         let unpadded_inner = plaintext
@@ -816,45 +828,57 @@ impl Tls13RecordCipher {
         let ciphertext_len = inner_len
             .checked_add(16)
             .ok_or(CryptoError::InvalidRecord)?;
+        if ciphertext_len > MAX_TLS_CIPHERTEXT_RECORD_LEN {
+            return Err(CryptoError::InvalidRecord);
+        }
         let ct_len_u16 = u16::try_from(ciphertext_len).map_err(|_| CryptoError::InvalidRecord)?;
 
-        let mut record = Vec::with_capacity(5usize.saturating_add(ciphertext_len));
-        record.push(0x17);
-        record.push(0x03);
-        record.push(0x03);
-        record.extend_from_slice(&ct_len_u16.to_be_bytes());
+        let [ct0, ct1] = ct_len_u16.to_be_bytes();
+        let aad: [u8; 5] = [0x17, 0x03, 0x03, ct0, ct1];
 
-        let aad: [u8; 5] = [
-            0x17,
-            0x03,
-            0x03,
-            *ct_len_u16.to_be_bytes().first().unwrap_or(&0),
-            *ct_len_u16.to_be_bytes().get(1).unwrap_or(&0),
-        ];
-
-        let mut inner = Vec::with_capacity(ciphertext_len);
-        inner.extend_from_slice(plaintext);
-        inner.push(inner_content_type);
-        inner.resize(inner_len, 0);
+        let total_wire_len = 5usize.saturating_add(ciphertext_len);
+        if record.capacity() < total_wire_len {
+            record.reserve(total_wire_len.saturating_sub(record.len()));
+        }
+        record.extend_from_slice(&aad);
+        record.extend_from_slice(plaintext);
+        record.push(inner_content_type);
+        record.resize(5usize.saturating_add(inner_len), 0);
 
         let nonce = self.next_nonce()?;
-        match &self.cipher {
+        let body = record.get_mut(5..).ok_or(CryptoError::InvalidRecord)?;
+        let tag = match &self.cipher {
             CipherKind::Aes128(c) => c
-                .encrypt_in_place(&AeadNonce::<Aes128Gcm>::from(nonce), &aad, &mut inner)
+                .encrypt_inout_detached(&AeadNonce::<Aes128Gcm>::from(nonce), &aad, body.into())
                 .map_err(|_| CryptoError::AeadFailed)?,
             CipherKind::Aes256(c) => c
-                .encrypt_in_place(&AeadNonce::<Aes256Gcm>::from(nonce), &aad, &mut inner)
+                .encrypt_inout_detached(&AeadNonce::<Aes256Gcm>::from(nonce), &aad, body.into())
                 .map_err(|_| CryptoError::AeadFailed)?,
             CipherKind::ChaCha20(c) => c
-                .encrypt_in_place(
+                .encrypt_inout_detached(
                     &AeadNonce::<ChaCha20Poly1305>::from(nonce),
                     &aad,
-                    &mut inner,
+                    body.into(),
                 )
                 .map_err(|_| CryptoError::AeadFailed)?,
-        }
+        };
 
-        record.extend_from_slice(&inner);
+        record.extend_from_slice(tag.as_slice());
+        Ok(())
+    }
+
+    /// Encrypts a TLS 1.3 record, optionally zero-padding the inner plaintext so
+    /// the resulting TLS wire record length equals `target_wire_len` (when `target_wire_len`
+    /// is at least as large as the unpadded wire length).
+    pub fn seal_record(
+        &mut self,
+        inner_content_type: u8,
+        plaintext: &[u8],
+        target_wire_len: Option<usize>,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let mut record =
+            Vec::with_capacity(5usize.saturating_add(plaintext.len()).saturating_add(17));
+        self.seal_record_into(inner_content_type, plaintext, target_wire_len, &mut record)?;
         Ok(record)
     }
 
@@ -868,10 +892,13 @@ impl Tls13RecordCipher {
         let b3 = *hdr.get(3).ok_or(CryptoError::InvalidRecord)?;
         let b4 = *hdr.get(4).ok_or(CryptoError::InvalidRecord)?;
         let ct_len = usize::from(u16::from_be_bytes([b3, b4]));
+        if !(17..=MAX_TLS_CIPHERTEXT_RECORD_LEN).contains(&ct_len) {
+            return Err(CryptoError::InvalidRecord);
+        }
         let total_len = 5usize
             .checked_add(ct_len)
             .ok_or(CryptoError::InvalidRecord)?;
-        if wire_record.len() != total_len || ct_len < 17 {
+        if wire_record.len() != total_len {
             return Err(CryptoError::InvalidRecord);
         }
 
@@ -879,22 +906,33 @@ impl Tls13RecordCipher {
         let mut buf = ct_slice.to_vec();
 
         let nonce = self.next_nonce()?;
-        match &self.cipher {
-            CipherKind::Aes128(c) => c
-                .decrypt_in_place(&AeadNonce::<Aes128Gcm>::from(nonce), hdr, &mut buf)
-                .map_err(|_| CryptoError::AeadFailed)?,
-            CipherKind::Aes256(c) => c
-                .decrypt_in_place(&AeadNonce::<Aes256Gcm>::from(nonce), hdr, &mut buf)
-                .map_err(|_| CryptoError::AeadFailed)?,
-            CipherKind::ChaCha20(c) => c
-                .decrypt_in_place(&AeadNonce::<ChaCha20Poly1305>::from(nonce), hdr, &mut buf)
-                .map_err(|_| CryptoError::AeadFailed)?,
+        let decrypt_res = match &self.cipher {
+            CipherKind::Aes128(c) => {
+                c.decrypt_in_place(&AeadNonce::<Aes128Gcm>::from(nonce), hdr, &mut buf)
+            }
+            CipherKind::Aes256(c) => {
+                c.decrypt_in_place(&AeadNonce::<Aes256Gcm>::from(nonce), hdr, &mut buf)
+            }
+            CipherKind::ChaCha20(c) => {
+                c.decrypt_in_place(&AeadNonce::<ChaCha20Poly1305>::from(nonce), hdr, &mut buf)
+            }
+        };
+        if decrypt_res.is_err() {
+            buf.zeroize();
+            return Err(CryptoError::AeadFailed);
         }
 
         while buf.last() == Some(&0) {
             buf.pop();
         }
-        let content_type = buf.pop().ok_or(CryptoError::InvalidRecord)?;
+        let Some(content_type) = buf.pop() else {
+            buf.zeroize();
+            return Err(CryptoError::InvalidRecord);
+        };
+        if buf.len() > MAX_TLS_RECORD_FRAGMENT {
+            buf.zeroize();
+            return Err(CryptoError::InvalidRecord);
+        }
         Ok((content_type, buf))
     }
 

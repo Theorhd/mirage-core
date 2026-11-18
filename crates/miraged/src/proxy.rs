@@ -3,14 +3,14 @@
 //! with anti-SSRF egress enforcement, and transparent fallback relay to `dest`.
 
 use core::future::Future;
-use core::net::{IpAddr, SocketAddr};
+use core::net::SocketAddr;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
 use mirage_core::crypto::RealityCertTemplate;
-use mirage_core::egress::EgressPolicy;
 use mirage_core::reality::{
     authenticate_client_hello, prepare_server_flight, AuthFallbackReason, AuthOutcome,
     AuthenticatedClient, ClientFlightStatus, RealityAuthParams, RealityTlsReader,
@@ -22,8 +22,8 @@ use mirage_core::tls_parser::{
 };
 use mirage_core::vision::{UnpadMode, VisionPadder, VisionTlsFilter, VisionUnpadder};
 use mirage_core::vless::{
-    decode_udp_packet, encode_udp_packet, encode_vless_response_header, parse_vless_request,
-    VlessAddress, VlessCommand, VlessFlow, VlessParseOutcome, VlessRequest,
+    decode_udp_packet, encode_udp_packet_into, encode_vless_response_header, parse_vless_request,
+    VlessCommand, VlessFlow, VlessParseOutcome, VlessRequest,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -35,6 +35,8 @@ use crate::config::{Config, VlessConfig};
 use crate::dns::DnsResolver;
 use crate::error::DaemonError;
 use crate::metrics::Metrics;
+use crate::mux::{relay_vless_mux, GlobalUdpTable};
+use crate::outbound::{connect_happy_eyeballs, EgressContext};
 
 /// Brief backoff if `accept()` encounters a transient OS resource error.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
@@ -51,9 +53,21 @@ const MAX_DEST_FLIGHT_BYTES: usize = 32 * 1024;
 /// Maximum bytes buffered while decoding the initial VLESS request header.
 const MAX_VLESS_HEADER_BYTES: usize = 4096;
 
-/// Outbound/upstream read chunk size kept safely below TLS 1.3 16 KiB limit
-/// (even with Vision framing & padding overhead).
+/// Outbound/upstream read chunk size for padded Vision streams (fits safely below
+/// the TLS 1.3 16 KiB limit after adding Vision command & padding overhead).
 const RELAY_CHUNK_SIZE: usize = 8192;
+
+/// Outbound/upstream read chunk size for unpadded streams (matches max TLS 1.3 fragment).
+const PLAIN_RELAY_CHUNK_SIZE: usize = 16 * 1024;
+
+/// Idle timeout enforced on active TCP relay streams to prevent hung half-open leaks.
+const TCP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Idle timeout enforced on connected 1:1 UDP relay sockets.
+const UDP_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Maximum buffered bytes in the VLESS-over-UDP reassembly buffer (max 64 KiB UDP datagram + 16 KiB TLS record).
+const MAX_UDP_STREAM_BUFFER: usize = 65_537 + 16_384;
 
 /// Brief grace window to gather trailing `dest` encrypted records when
 /// `ServerHello` has already arrived.
@@ -72,6 +86,7 @@ pub struct ReloadableState {
 /// handles without interruption while rotated-out secrets are dropped and zeroized.
 pub struct SharedRuntime {
     hmac_key: Zeroizing<[u8; 32]>,
+    udp_table: Arc<GlobalUdpTable>,
     state: RwLock<Arc<ReloadableState>>,
 }
 
@@ -94,6 +109,7 @@ impl SharedRuntime {
 
         Ok(Arc::new(Self {
             hmac_key,
+            udp_table: Arc::new(GlobalUdpTable::new()),
             state: RwLock::new(Arc::new(ReloadableState {
                 config,
                 replay_cache,
@@ -138,9 +154,19 @@ impl SharedRuntime {
             (None, _, _) => None,
         };
 
-        let dns_resolver = new_config
-            .vless()
-            .map(|vc| Arc::new(DnsResolver::new(vc.dns_resolver(), vc.allow_system_dns())));
+        let dns_resolver = match (new_config.vless(), old.config.vless(), &old.dns_resolver) {
+            (Some(new_vc), Some(old_vc), Some(existing))
+                if new_vc.dns_resolver() == old_vc.dns_resolver()
+                    && new_vc.allow_system_dns() == old_vc.allow_system_dns() =>
+            {
+                Some(Arc::clone(existing))
+            }
+            (Some(new_vc), _, _) => Some(Arc::new(DnsResolver::new(
+                new_vc.dns_resolver(),
+                new_vc.allow_system_dns(),
+            ))),
+            (None, _, _) => None,
+        };
 
         let next_state = Arc::new(ReloadableState {
             config: new_config,
@@ -220,6 +246,7 @@ where
                     snap,
                     Arc::clone(&metrics),
                     Arc::clone(&cert_template),
+                    Arc::clone(&runtime.udp_table),
                     permit,
                 ));
             }
@@ -238,6 +265,7 @@ async fn handle_connection_state(
     state: Arc<ReloadableState>,
     metrics: Arc<Metrics>,
     cert_template: Arc<RealityCertTemplate>,
+    udp_table: Arc<GlobalUdpTable>,
     permit: OwnedSemaphorePermit,
 ) {
     handle_connection(
@@ -247,11 +275,13 @@ async fn handle_connection_state(
         cert_template,
         state.replay_cache.as_ref().map(Arc::clone),
         state.dns_resolver.as_ref().map(Arc::clone),
+        udp_table,
         permit,
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut client: TcpStream,
     config: &Config,
@@ -259,6 +289,7 @@ async fn handle_connection(
     cert_template: Arc<RealityCertTemplate>,
     replay_cache: Option<Arc<Mutex<ReplayCache>>>,
     dns_resolver: Option<Arc<DnsResolver>>,
+    udp_table: Arc<GlobalUdpTable>,
     _permit: OwnedSemaphorePermit,
 ) {
     let _ = client.set_nodelay(true);
@@ -315,8 +346,9 @@ async fn handle_connection(
                         *auth,
                         config,
                         &cert_template,
-                        dns_resolver.as_deref(),
-                        &metrics,
+                        dns_resolver,
+                        udp_table,
+                        metrics,
                     )
                     .await;
                     return;
@@ -410,8 +442,9 @@ async fn complete_reality_handshake(
     auth: AuthenticatedClient,
     config: &Config,
     cert_template: &RealityCertTemplate,
-    dns_resolver: Option<&DnsResolver>,
-    metrics: &Metrics,
+    dns_resolver: Option<Arc<DnsResolver>>,
+    udp_table: Arc<GlobalUdpTable>,
+    metrics: Arc<Metrics>,
 ) {
     let Ok(mut dest) = TcpStream::connect(config.dest_addr()).await else {
         metrics.inc_dial_dest_failed();
@@ -419,7 +452,14 @@ async fn complete_reality_handshake(
     };
     let _ = dest.set_nodelay(true);
 
-    if dest.write_all(&buffered_ch).await.is_err() {
+    let ch_only = buffered_ch
+        .get(..client_hello.wire_bytes_len)
+        .unwrap_or(&buffered_ch);
+    let pipelined_after_ch = buffered_ch
+        .get(client_hello.wire_bytes_len..)
+        .unwrap_or(&[]);
+
+    if dest.write_all(ch_only).await.is_err() {
         metrics.inc_reality_dest_profile_fallback();
         return;
     }
@@ -429,6 +469,9 @@ async fn complete_reality_handshake(
 
     let Some(dest_profile) = profile else {
         metrics.inc_reality_dest_profile_fallback();
+        if !pipelined_after_ch.is_empty() && dest.write_all(pipelined_after_ch).await.is_err() {
+            return;
+        }
         if !dest_buf.is_empty() && client.write_all(&dest_buf).await.is_err() {
             return;
         }
@@ -461,32 +504,50 @@ async fn complete_reality_handshake(
         return;
     }
 
-    let mut buf = [0u8; READ_CHUNK_SIZE];
-    let handshake_res = tokio::time::timeout(config.initial_read_timeout(), async {
-        loop {
-            let n = client.read(&mut buf).await.ok()?;
-            if n == 0 {
-                return None;
-            }
-            let slice = buf.get(..n)?;
-            match prepared.pending.feed_client_bytes(slice) {
-                ClientFlightStatus::NeedMoreData => continue,
-                ClientFlightStatus::Complete {
-                    session,
-                    initial_app_data: _,
-                } => return Some(session),
-                ClientFlightStatus::Failed => return None,
-            }
+    let pre_session = if !pipelined_after_ch.is_empty() {
+        match prepared.pending.feed_client_bytes(pipelined_after_ch) {
+            ClientFlightStatus::NeedMoreData => None,
+            ClientFlightStatus::Complete {
+                session,
+                initial_app_data: _,
+            } => Some(session),
+            ClientFlightStatus::Failed => return,
         }
-    })
-    .await;
+    } else {
+        None
+    };
 
-    let Ok(Some(session)) = handshake_res else {
-        return;
+    let session = if let Some(s) = pre_session {
+        s
+    } else {
+        let mut buf = [0u8; READ_CHUNK_SIZE];
+        let handshake_res = tokio::time::timeout(config.initial_read_timeout(), async {
+            loop {
+                let n = client.read(&mut buf).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                let slice = buf.get(..n)?;
+                match prepared.pending.feed_client_bytes(slice) {
+                    ClientFlightStatus::NeedMoreData => continue,
+                    ClientFlightStatus::Complete {
+                        session,
+                        initial_app_data: _,
+                    } => return Some(session),
+                    ClientFlightStatus::Failed => return None,
+                }
+            }
+        })
+        .await;
+
+        let Ok(Some(s)) = handshake_res else {
+            return;
+        };
+        s
     };
 
     metrics.inc_reality_handshake_completed();
-    drive_authenticated_session(client, *session, config, dns_resolver, metrics).await;
+    drive_authenticated_session(client, *session, config, dns_resolver, udp_table, metrics).await;
 }
 
 async fn read_dest_profile(
@@ -552,8 +613,9 @@ async fn drive_authenticated_session(
     mut client: TcpStream,
     mut session: RealityTlsSession,
     config: &Config,
-    dns_resolver: Option<&DnsResolver>,
-    metrics: &Metrics,
+    dns_resolver: Option<Arc<DnsResolver>>,
+    udp_table: Arc<GlobalUdpTable>,
+    metrics: Arc<Metrics>,
 ) {
     let Some(vless_cfg) = config.vless() else {
         // Milestone 2 mode (no [vless] configured): drain encrypted TLS 1.3 records cleanly.
@@ -588,18 +650,49 @@ async fn drive_authenticated_session(
         &mut tls_reader,
         vless_cfg,
         config.initial_read_timeout(),
-        metrics,
+        &metrics,
     )
     .await
     else {
         return;
     };
 
-    let Some(target_addr) =
-        resolve_and_validate_egress(&req, config, vless_cfg, dns_resolver, metrics).await
-    else {
+    let local_socket_ip = client.local_addr().ok().map(|a| a.ip());
+    let egress_ctx = EgressContext::from_config(config, vless_cfg, local_socket_ip);
+
+    if req.command == VlessCommand::Mux {
+        // XTLS-Vision flow is defined for raw TCP/UDP streams, not inner Mux framing.
+        if req.flow != VlessFlow::None {
+            return;
+        }
+        metrics.inc_vless_mux_sessions();
+        relay_vless_mux(
+            client,
+            tls_reader,
+            tls_writer,
+            req.uuid.clone(),
+            trailing_app_data,
+            egress_ctx,
+            dns_resolver,
+            udp_table,
+            metrics,
+        )
+        .await;
         return;
-    };
+    }
+
+    let targets = egress_ctx
+        .resolve_and_validate(
+            &req.address,
+            req.port,
+            req.command == VlessCommand::Tcp,
+            dns_resolver.as_deref(),
+            &metrics,
+        )
+        .await;
+    if targets.is_empty() {
+        return;
+    }
 
     match req.command {
         VlessCommand::Tcp => {
@@ -610,12 +703,15 @@ async fn drive_authenticated_session(
                 tls_writer,
                 req,
                 trailing_app_data,
-                target_addr,
-                metrics,
+                &targets,
+                &metrics,
             )
             .await;
         }
         VlessCommand::Udp => {
+            let Some(&target_addr) = targets.first() else {
+                return;
+            };
             metrics.inc_vless_udp_sessions();
             relay_vless_udp(
                 client,
@@ -623,6 +719,7 @@ async fn drive_authenticated_session(
                 tls_writer,
                 trailing_app_data,
                 target_addr,
+                &metrics,
             )
             .await;
         }
@@ -687,49 +784,18 @@ async fn read_vless_header(
     }
 }
 
-async fn resolve_and_validate_egress(
-    req: &VlessRequest,
-    config: &Config,
-    vless_cfg: &VlessConfig,
-    dns_resolver: Option<&DnsResolver>,
-    metrics: &Metrics,
-) -> Option<SocketAddr> {
-    let is_tcp = req.command == VlessCommand::Tcp;
-    let policy = EgressPolicy {
-        allow_private_egress: vless_cfg.allow_private_egress(),
-        allow_smtp_port_25: vless_cfg.allow_smtp_port_25(),
-        blocked_ips: vec![config.listen_addr().ip(), config.dest_addr().ip()],
-    };
-
-    let candidate_ips: Vec<IpAddr> = match &req.address {
-        VlessAddress::Ipv4(v4) => vec![IpAddr::V4(*v4)],
-        VlessAddress::Ipv6(v6) => vec![IpAddr::V6(*v6)],
-        VlessAddress::Domain(domain) => dns_resolver?.resolve(domain).await?,
-    };
-
-    for ip in candidate_ips {
-        if let Ok(validated) = policy.validate_target(ip, req.port, is_tcp) {
-            return Some(validated);
-        }
-    }
-
-    metrics.inc_egress_blocked();
-    None
-}
-
 async fn relay_vless_tcp(
     client: TcpStream,
     mut tls_reader: RealityTlsReader,
     mut tls_writer: RealityTlsWriter,
     req: Box<VlessRequest>,
     mut trailing_app_data: Zeroizing<Vec<u8>>,
-    target_addr: SocketAddr,
+    targets: &[SocketAddr],
     metrics: &Metrics,
 ) {
-    let Ok(upstream) = TcpStream::connect(target_addr).await else {
+    let Some(upstream) = connect_happy_eyeballs(targets).await else {
         return;
     };
-    let _ = upstream.set_nodelay(true);
 
     let (mut client_read, mut client_write) = client.into_split();
     let (mut up_read, mut up_write) = upstream.into_split();
@@ -751,12 +817,15 @@ async fn relay_vless_tcp(
             }
             trailing_app_data.zeroize();
 
-            let up_fut = relay_plain_uplink(&mut client_read, &mut tls_reader, &mut up_write);
-            let down_fut = relay_plain_downlink(&mut up_read, &mut tls_writer, &mut client_write);
+            let up_fut =
+                relay_plain_uplink(&mut client_read, &mut tls_reader, &mut up_write, metrics);
+            let down_fut =
+                relay_plain_downlink(&mut up_read, &mut tls_writer, &mut client_write, metrics);
             let _ = tokio::join!(up_fut, down_fut);
         }
         VlessFlow::Vision { .. } => {
             let tls_filter = Arc::new(Mutex::new(VisionTlsFilter::new()));
+            let filter_done = Arc::new(AtomicBool::new(false));
             let uuid = req.uuid.clone();
             let up_fut = relay_vision_uplink(
                 &mut client_read,
@@ -765,6 +834,8 @@ async fn relay_vless_tcp(
                 uuid.clone(),
                 trailing_app_data,
                 Arc::clone(&tls_filter),
+                Arc::clone(&filter_done),
+                metrics,
             );
             let down_fut = relay_vision_downlink(
                 &mut up_read,
@@ -772,6 +843,7 @@ async fn relay_vless_tcp(
                 &mut client_write,
                 uuid,
                 tls_filter,
+                filter_done,
                 metrics,
             );
             let _ = tokio::join!(up_fut, down_fut);
@@ -783,8 +855,9 @@ async fn relay_plain_uplink(
     client_read: &mut OwnedReadHalf,
     tls_reader: &mut RealityTlsReader,
     up_write: &mut OwnedWriteHalf,
+    metrics: &Metrics,
 ) {
-    let mut wire = [0u8; RELAY_CHUNK_SIZE];
+    let mut wire = [0u8; PLAIN_RELAY_CHUNK_SIZE];
     loop {
         match tls_reader.next_record() {
             Ok(Some((0x17, payload))) => {
@@ -802,12 +875,17 @@ async fn relay_plain_uplink(
             Err(_) => break,
         }
 
-        match client_read.read(&mut wire).await {
-            Ok(0) | Err(_) => {
+        match tokio::time::timeout(TCP_RELAY_IDLE_TIMEOUT, client_read.read(&mut wire)).await {
+            Ok(Ok(0) | Err(_)) => {
                 let _ = up_write.shutdown().await;
                 break;
             }
-            Ok(n) => {
+            Err(_) => {
+                metrics.inc_idle_timeouts();
+                let _ = up_write.shutdown().await;
+                break;
+            }
+            Ok(Ok(n)) => {
                 if let Some(s) = wire.get(..n) {
                     tls_reader.push_wire_bytes(s);
                 }
@@ -820,33 +898,58 @@ async fn relay_plain_downlink(
     up_read: &mut OwnedReadHalf,
     tls_writer: &mut RealityTlsWriter,
     client_write: &mut OwnedWriteHalf,
+    metrics: &Metrics,
 ) {
-    let mut buf = [0u8; RELAY_CHUNK_SIZE];
+    let mut buf = [0u8; PLAIN_RELAY_CHUNK_SIZE];
+    let mut record_buf = Zeroizing::new(Vec::with_capacity(PLAIN_RELAY_CHUNK_SIZE + 32));
     loop {
-        match up_read.read(&mut buf).await {
-            Ok(0) => {
-                if let Ok(alert) = tls_writer.seal_app_data(&[]) {
-                    let _ = client_write.write_all(&alert).await;
+        match tokio::time::timeout(TCP_RELAY_IDLE_TIMEOUT, up_read.read(&mut buf)).await {
+            Ok(Ok(0)) => {
+                if tls_writer.seal_app_data_into(&[], &mut record_buf).is_ok() {
+                    let _ = client_write.write_all(&record_buf).await;
                 }
                 let _ = client_write.shutdown().await;
                 break;
             }
-            Ok(n) => {
+            Ok(Ok(n)) => {
                 let Some(slice) = buf.get(..n) else {
                     break;
                 };
-                let Ok(sealed) = tls_writer.seal_app_data(slice) else {
+                if tls_writer
+                    .seal_app_data_into(slice, &mut record_buf)
+                    .is_err()
+                {
                     break;
-                };
-                if client_write.write_all(&sealed).await.is_err() {
+                }
+                if client_write.write_all(&record_buf).await.is_err() {
                     break;
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                metrics.inc_idle_timeouts();
+                break;
+            }
+            Ok(Err(_)) => break,
         }
     }
 }
 
+fn inspect_vision_filter(
+    payload: &[u8],
+    tls_filter: &Mutex<VisionTlsFilter>,
+    filter_done: &AtomicBool,
+) {
+    if filter_done.load(Ordering::Acquire) {
+        return;
+    }
+    let mut f = tls_filter.lock().unwrap_or_else(|e| e.into_inner());
+    f.inspect(payload);
+    if f.is_finished() {
+        filter_done.store(true, Ordering::Release);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn relay_vision_uplink(
     client_read: &mut OwnedReadHalf,
     mut tls_reader: RealityTlsReader,
@@ -854,6 +957,8 @@ async fn relay_vision_uplink(
     uuid: mirage_core::vless::VlessUuid,
     mut trailing_app_data: Zeroizing<Vec<u8>>,
     tls_filter: Arc<Mutex<VisionTlsFilter>>,
+    filter_done: Arc<AtomicBool>,
+    metrics: &Metrics,
 ) {
     let mut unpadder = VisionUnpadder::new(uuid);
 
@@ -861,10 +966,7 @@ async fn relay_vision_uplink(
         let out = unpadder.feed(&trailing_app_data);
         trailing_app_data.zeroize();
         if !out.payload.is_empty() {
-            {
-                let mut f = tls_filter.lock().unwrap_or_else(|e| e.into_inner());
-                f.inspect(&out.payload);
-            }
+            inspect_vision_filter(&out.payload, &tls_filter, &filter_done);
             if up_write.write_all(&out.payload).await.is_err() {
                 return;
             }
@@ -879,7 +981,7 @@ async fn relay_vision_uplink(
             if !rem_raw.is_empty() && up_write.write_all(&rem_raw).await.is_err() {
                 return;
             }
-            let _ = tokio::io::copy(client_read, up_write).await;
+            let _ = copy_with_idle_timeout(client_read, up_write, metrics).await;
             let _ = up_write.shutdown().await;
             return;
         }
@@ -892,10 +994,7 @@ async fn relay_vision_uplink(
                 Ok(Some((0x17, payload))) => {
                     let out = unpadder.feed(&payload);
                     if !out.payload.is_empty() {
-                        {
-                            let mut f = tls_filter.lock().unwrap_or_else(|e| e.into_inner());
-                            f.inspect(&out.payload);
-                        }
+                        inspect_vision_filter(&out.payload, &tls_filter, &filter_done);
                         if up_write.write_all(&out.payload).await.is_err() {
                             return;
                         }
@@ -910,7 +1009,7 @@ async fn relay_vision_uplink(
                         if !rem_raw.is_empty() && up_write.write_all(&rem_raw).await.is_err() {
                             return;
                         }
-                        let _ = tokio::io::copy(client_read, up_write).await;
+                        let _ = copy_with_idle_timeout(client_read, up_write, metrics).await;
                         let _ = up_write.shutdown().await;
                         return;
                     }
@@ -925,12 +1024,17 @@ async fn relay_vision_uplink(
             }
         }
 
-        match client_read.read(&mut wire).await {
-            Ok(0) | Err(_) => {
+        match tokio::time::timeout(TCP_RELAY_IDLE_TIMEOUT, client_read.read(&mut wire)).await {
+            Ok(Ok(0) | Err(_)) => {
                 let _ = up_write.shutdown().await;
                 return;
             }
-            Ok(n) => {
+            Err(_) => {
+                metrics.inc_idle_timeouts();
+                let _ = up_write.shutdown().await;
+                return;
+            }
+            Ok(Ok(n)) => {
                 if let Some(s) = wire.get(..n) {
                     tls_reader.push_wire_bytes(s);
                 }
@@ -939,52 +1043,151 @@ async fn relay_vision_uplink(
     }
 }
 
+fn split_leading_tls_record_len(buf: &[u8]) -> Option<usize> {
+    let hdr = buf.get(..5)?;
+    let ct = *hdr.first()?;
+    let ver_maj = *hdr.get(1)?;
+    let ver_min = *hdr.get(2)?;
+    if !matches!(ct, 0x14..=0x17) || ver_maj != 0x03 || !matches!(ver_min, 0x00..=0x04) {
+        return None;
+    }
+    let rec_len = usize::from(u16::from_be_bytes([*hdr.get(3)?, *hdr.get(4)?]));
+    let total = 5usize.checked_add(rec_len)?;
+    if rec_len == 0 || total >= buf.len() {
+        return None;
+    }
+    Some(total)
+}
+
 async fn relay_vision_downlink(
     up_read: &mut OwnedReadHalf,
     mut tls_writer: RealityTlsWriter,
     client_write: &mut OwnedWriteHalf,
     uuid: mirage_core::vless::VlessUuid,
     tls_filter: Arc<Mutex<VisionTlsFilter>>,
+    filter_done: Arc<AtomicBool>,
     metrics: &Metrics,
 ) {
     let mut padder = VisionPadder::new(uuid);
     let mut buf = [0u8; RELAY_CHUNK_SIZE];
+    let mut big_buf = [0u8; PLAIN_RELAY_CHUNK_SIZE];
+    let mut record_buf = Zeroizing::new(Vec::with_capacity(PLAIN_RELAY_CHUNK_SIZE + 32));
 
     loop {
-        match up_read.read(&mut buf).await {
-            Ok(0) => {
+        let target_buf = if padder.is_padding() {
+            &mut buf[..]
+        } else {
+            &mut big_buf[..]
+        };
+
+        match tokio::time::timeout(TCP_RELAY_IDLE_TIMEOUT, up_read.read(target_buf)).await {
+            Ok(Ok(0)) => {
                 let _ = client_write.shutdown().await;
                 return;
             }
-            Ok(n) => {
-                let Some(slice) = buf.get(..n) else {
+            Ok(Ok(n)) => {
+                let Some(slice) = target_buf.get(..n) else {
                     return;
                 };
-                let filter_snapshot = {
-                    let mut f = tls_filter.lock().unwrap_or_else(|e| e.into_inner());
-                    f.inspect(slice);
-                    f.clone()
-                };
-                let mut rand_bytes = [0u8; 4];
-                if getrandom::fill(&mut rand_bytes).is_err() {
-                    return;
-                }
-                let rand_u32 = u32::from_be_bytes(rand_bytes);
-                let out_bytes = padder.wrap_outbound(slice, &filter_snapshot, rand_u32);
-                let Ok(sealed) = tls_writer.seal_app_data(&out_bytes) else {
-                    return;
-                };
-                if client_write.write_all(&sealed).await.is_err() {
-                    return;
-                }
-                if padder.direct_copy_active() {
-                    metrics.inc_vision_direct_switches();
-                    let _ = tokio::io::copy(up_read, client_write).await;
-                    let _ = client_write.shutdown().await;
-                    return;
+                if padder.is_padding() {
+                    let mut rem = slice;
+                    while !rem.is_empty() && padder.is_padding() {
+                        // Split coalesced non-ApplicationData TLS records (e.g. ServerHello
+                        // followed immediately by 0x17 encrypted flight) so Vision detects
+                        // inner TLS 1.3 `0x17` boundaries cleanly.
+                        let piece_len = if rem.first() != Some(&0x17) {
+                            split_leading_tls_record_len(rem).unwrap_or(rem.len())
+                        } else {
+                            rem.len()
+                        };
+                        let Some(piece) = rem.get(..piece_len) else {
+                            return;
+                        };
+                        rem = rem.get(piece_len..).unwrap_or(&[]);
+
+                        let filter_snapshot = {
+                            let mut f = tls_filter.lock().unwrap_or_else(|e| e.into_inner());
+                            f.inspect(piece);
+                            if f.is_finished() {
+                                filter_done.store(true, Ordering::Release);
+                            }
+                            f.clone()
+                        };
+                        let mut rand_bytes = [0u8; 4];
+                        if getrandom::fill(&mut rand_bytes).is_err() {
+                            return;
+                        }
+                        let rand_u32 = u32::from_be_bytes(rand_bytes);
+                        let wrapped = padder.wrap_outbound(piece, &filter_snapshot, rand_u32);
+                        let switched_direct = padder.direct_copy_active();
+                        if tls_writer
+                            .seal_app_data_into(&wrapped, &mut record_buf)
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if client_write.write_all(&record_buf).await.is_err() {
+                            return;
+                        }
+                        if switched_direct {
+                            metrics.inc_vision_direct_switches();
+                            if !rem.is_empty() && client_write.write_all(rem).await.is_err() {
+                                return;
+                            }
+                            let _ = copy_with_idle_timeout(up_read, client_write, metrics).await;
+                            let _ = client_write.shutdown().await;
+                            return;
+                        }
+                    }
+                    if !rem.is_empty() {
+                        if tls_writer.seal_app_data_into(rem, &mut record_buf).is_err() {
+                            return;
+                        }
+                        if client_write.write_all(&record_buf).await.is_err() {
+                            return;
+                        }
+                    }
+                } else {
+                    if tls_writer
+                        .seal_app_data_into(slice, &mut record_buf)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if client_write.write_all(&record_buf).await.is_err() {
+                        return;
+                    }
                 }
             }
-            Err(_) => return,
+            Err(_) => {
+                metrics.inc_idle_timeouts();
+                return;
+            }
+            Ok(Err(_)) => return,
+        }
+    }
+}
+
+async fn copy_with_idle_timeout(
+    reader: &mut OwnedReadHalf,
+    writer: &mut OwnedWriteHalf,
+    metrics: &Metrics,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; PLAIN_RELAY_CHUNK_SIZE];
+    loop {
+        match tokio::time::timeout(TCP_RELAY_IDLE_TIMEOUT, reader.read(&mut buf)).await {
+            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(n)) => {
+                let Some(slice) = buf.get(..n) else {
+                    return Ok(());
+                };
+                writer.write_all(slice).await?;
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                metrics.inc_idle_timeouts();
+                return Ok(());
+            }
         }
     }
 }
@@ -995,6 +1198,7 @@ async fn relay_vless_udp(
     mut tls_writer: RealityTlsWriter,
     mut trailing_app_data: Zeroizing<Vec<u8>>,
     target_addr: SocketAddr,
+    metrics: &Metrics,
 ) {
     let bind_addr = if target_addr.is_ipv6() {
         "[::]:0"
@@ -1021,27 +1225,58 @@ async fn relay_vless_udp(
     }
 
     let up_fut = async {
-        let mut pkt_buf = Vec::from(trailing_app_data.as_slice());
+        let mut pkt_buf = Zeroizing::new(Vec::from(trailing_app_data.as_slice()));
+        let mut pkt_offset = 0usize;
         trailing_app_data.zeroize();
         let mut wire = [0u8; RELAY_CHUNK_SIZE];
 
         loop {
-            while let Ok(Some((pkt, consumed))) = decode_udp_packet(&pkt_buf) {
-                pkt_buf.drain(..consumed);
-                if udp_send.send(&pkt).await.is_err() {
-                    return;
+            while let Some(avail) = pkt_buf.get(pkt_offset..) {
+                match decode_udp_packet(avail) {
+                    Ok(Some((pkt, consumed))) => {
+                        pkt_offset = pkt_offset.saturating_add(consumed);
+                        if udp_send.send(&pkt).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => return,
                 }
+            }
+            if pkt_offset >= pkt_buf.len() {
+                pkt_buf.clear();
+                pkt_offset = 0;
+            } else if pkt_offset >= 16_384 {
+                pkt_buf.drain(..pkt_offset);
+                pkt_offset = 0;
             }
 
             loop {
                 match tls_reader.next_record() {
                     Ok(Some((0x17, payload))) => {
+                        let unread_len = pkt_buf.len().saturating_sub(pkt_offset);
+                        if unread_len.saturating_add(payload.len()) > MAX_UDP_STREAM_BUFFER {
+                            return;
+                        }
                         pkt_buf.extend_from_slice(&payload);
-                        while let Ok(Some((pkt, consumed))) = decode_udp_packet(&pkt_buf) {
-                            pkt_buf.drain(..consumed);
-                            if udp_send.send(&pkt).await.is_err() {
-                                return;
+                        while let Some(avail) = pkt_buf.get(pkt_offset..) {
+                            match decode_udp_packet(avail) {
+                                Ok(Some((pkt, consumed))) => {
+                                    pkt_offset = pkt_offset.saturating_add(consumed);
+                                    if udp_send.send(&pkt).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(_) => return,
                             }
+                        }
+                        if pkt_offset >= pkt_buf.len() {
+                            pkt_buf.clear();
+                            pkt_offset = 0;
+                        } else if pkt_offset >= 16_384 {
+                            pkt_buf.drain(..pkt_offset);
+                            pkt_offset = 0;
                         }
                     }
                     Ok(Some((0x15, _))) => return,
@@ -1051,9 +1286,13 @@ async fn relay_vless_udp(
                 }
             }
 
-            match client_read.read(&mut wire).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => {
+            match tokio::time::timeout(UDP_RELAY_IDLE_TIMEOUT, client_read.read(&mut wire)).await {
+                Ok(Ok(0) | Err(_)) => return,
+                Err(_) => {
+                    metrics.inc_idle_timeouts();
+                    return;
+                }
+                Ok(Ok(n)) => {
                     if let Some(s) = wire.get(..n) {
                         tls_reader.push_wire_bytes(s);
                     }
@@ -1064,23 +1303,32 @@ async fn relay_vless_udp(
 
     let down_fut = async {
         let mut ubuf = [0u8; RELAY_CHUNK_SIZE];
+        let mut framed = Zeroizing::new(Vec::with_capacity(RELAY_CHUNK_SIZE + 2));
+        let mut record_buf = Zeroizing::new(Vec::with_capacity(RELAY_CHUNK_SIZE + 64));
         loop {
-            match udp_recv.recv(&mut ubuf).await {
-                Ok(n) => {
+            match tokio::time::timeout(UDP_RELAY_IDLE_TIMEOUT, udp_recv.recv(&mut ubuf)).await {
+                Ok(Ok(n)) => {
                     let Some(slice) = ubuf.get(..n) else {
                         return;
                     };
-                    let Ok(framed) = encode_udp_packet(slice) else {
+                    if encode_udp_packet_into(slice, &mut framed).is_err() {
                         return;
-                    };
-                    let Ok(sealed) = tls_writer.seal_app_data(&framed) else {
+                    }
+                    if tls_writer
+                        .seal_app_data_into(&framed, &mut record_buf)
+                        .is_err()
+                    {
                         return;
-                    };
-                    if client_write.write_all(&sealed).await.is_err() {
+                    }
+                    if client_write.write_all(&record_buf).await.is_err() {
                         return;
                     }
                 }
-                Err(_) => return,
+                Err(_) => {
+                    metrics.inc_idle_timeouts();
+                    return;
+                }
+                Ok(Err(_)) => return,
             }
         }
     };

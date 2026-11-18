@@ -138,6 +138,12 @@ impl VisionTlsFilter {
         self.enable_xtls
     }
 
+    /// Returns `true` once the filter has completed inspecting the initial handshake window.
+    #[must_use]
+    pub const fn is_finished(&self) -> bool {
+        self.remaining_packets_to_filter == 0
+    }
+
     /// Returns `true` if any inner TLS ClientHello/ServerHello was detected.
     #[must_use]
     pub const fn is_tls(&self) -> bool {
@@ -482,19 +488,25 @@ impl VisionPadder {
             return self.encode_block(payload, command, long_padding, rand_u32);
         }
 
-        // Split oversized chunks so each Vision block stays <= MAX_VISION_BLOCK_TOTAL.
-        let mut out = Vec::with_capacity(payload.len().saturating_add(64));
-        let chunks: Vec<&[u8]> = payload.chunks(max_content).collect();
-        let last_idx = chunks.len().saturating_sub(1);
-        for (idx, chunk) in chunks.into_iter().enumerate() {
+        // Split oversized chunks so each Vision block stays <= MAX_VISION_BLOCK_TOTAL
+        // without allocating an intermediate `Vec<&[u8]>` or per-chunk `Vec<u8>`.
+        let chunks = payload.chunks(max_content);
+        let num_chunks = chunks.len();
+        let last_idx = num_chunks.saturating_sub(1);
+        let mut out =
+            Vec::with_capacity(payload.len().saturating_add(num_chunks.saturating_mul(64)));
+        let mut step_rand = rand_u32;
+        for (idx, chunk) in chunks.enumerate() {
             let chunk_cmd = if idx == last_idx {
                 command
             } else {
                 VisionCommand::Continue
             };
             let chunk_long = long_padding && idx < last_idx;
-            let block = self.encode_block(chunk, chunk_cmd, chunk_long, rand_u32);
-            out.extend_from_slice(&block);
+            self.encode_block_into(&mut out, chunk, chunk_cmd, chunk_long, step_rand);
+            step_rand = step_rand
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
         }
         out
     }
@@ -506,6 +518,19 @@ impl VisionPadder {
         long_padding: bool,
         rand_u32: u32,
     ) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_block_into(&mut out, content, command, long_padding, rand_u32);
+        out
+    }
+
+    fn encode_block_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        content: &[u8],
+        command: VisionCommand,
+        long_padding: bool,
+        rand_u32: u32,
+    ) {
         let content_len = content.len();
         let mut pad_len =
             if content_len < usize::try_from(DEFAULT_TESTSEED[0]).unwrap_or(900) && long_padding {
@@ -525,11 +550,11 @@ impl VisionPadder {
         }
 
         let uuid_len = if self.wrote_uuid { 0usize } else { 16usize };
-        let total_len = uuid_len
+        let block_len = uuid_len
             .saturating_add(5)
             .saturating_add(content_len)
             .saturating_add(pad_len);
-        let mut out = Vec::with_capacity(total_len);
+        out.reserve(block_len);
 
         if !self.wrote_uuid {
             out.extend_from_slice(self.user_uuid.as_bytes());
@@ -542,8 +567,8 @@ impl VisionPadder {
         out.extend_from_slice(&c_u16.to_be_bytes());
         out.extend_from_slice(&p_u16.to_be_bytes());
         out.extend_from_slice(content);
-        out.resize(total_len, 0);
-        out
+        let new_total = out.len().saturating_add(pad_len);
+        out.resize(new_total, 0);
     }
 }
 

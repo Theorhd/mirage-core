@@ -359,12 +359,20 @@ pub const fn encode_vless_response_header() -> [u8; 2] {
     [VLESS_VERSION_0, 0x00]
 }
 
-/// Encodes a single VLESS UDP packet (`2-byte big-endian length || payload`).
-pub fn encode_udp_packet(payload: &[u8]) -> Result<Vec<u8>, VlessError> {
+/// Encodes a single VLESS UDP packet (`2-byte big-endian length || payload`)
+/// into reusable buffer `out`.
+pub fn encode_udp_packet_into(payload: &[u8], out: &mut Vec<u8>) -> Result<(), VlessError> {
     let len_u16 = u16::try_from(payload.len()).map_err(|_| VlessError::MalformedUdpPacket)?;
-    let mut out = Vec::with_capacity(2usize.saturating_add(payload.len()));
+    out.clear();
     out.extend_from_slice(&len_u16.to_be_bytes());
     out.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Encodes a single VLESS UDP packet (`2-byte big-endian length || payload`).
+pub fn encode_udp_packet(payload: &[u8]) -> Result<Vec<u8>, VlessError> {
+    let mut out = Vec::with_capacity(2usize.saturating_add(payload.len()));
+    encode_udp_packet_into(payload, &mut out)?;
     Ok(out)
 }
 
