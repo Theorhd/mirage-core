@@ -7,6 +7,7 @@ use std::path::Path;
 
 use mirage_core::crypto::{ShortId, StaticPrivateKey};
 use mirage_core::tls_parser::DEFAULT_MAX_CLIENT_HELLO_BYTES;
+use mirage_core::vless::VlessUuid;
 use serde::de::{self, Visitor};
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -95,6 +96,56 @@ impl<'de> Deserialize<'de> for DeserializedShortId {
     }
 }
 
+struct DeserializedVlessUuid(VlessUuid);
+
+impl<'de> Deserialize<'de> for DeserializedVlessUuid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UuidVisitor;
+        impl Visitor<'_> for UuidVisitor {
+            type Value = DeserializedVlessUuid;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a standard UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                VlessUuid::from_str_hex(value)
+                    .map(DeserializedVlessUuid)
+                    .map_err(|_| de::Error::custom("invalid vless uuid"))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let zeroized = Zeroizing::new(value);
+                self.visit_str(&zeroized)
+            }
+        }
+        deserializer.deserialize_str(UuidVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVlessConfig {
+    uuids: Vec<DeserializedVlessUuid>,
+    #[serde(default)]
+    allow_private_egress: bool,
+    #[serde(default)]
+    allow_smtp_port_25: bool,
+    #[serde(default = "default_dns_resolver")]
+    dns_resolver: SocketAddr,
+    #[serde(default)]
+    allow_system_dns: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRealityConfig {
@@ -126,6 +177,8 @@ struct RawConfig {
     unsafe_debug_logging: bool,
     #[serde(default)]
     reality: Option<RawRealityConfig>,
+    #[serde(default)]
+    vless: Option<RawVlessConfig>,
 }
 
 const fn default_max_client_hello_bytes() -> usize {
@@ -146,6 +199,89 @@ const fn default_max_time_diff_secs() -> u64 {
 
 const fn default_replay_cache_capacity() -> usize {
     DEFAULT_REPLAY_CACHE_CAPACITY
+}
+
+fn default_dns_resolver() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 5353))
+}
+
+/// Validated VLESS protocol, egress policy, and private DNS configuration.
+#[derive(Clone)]
+pub struct VlessConfig {
+    uuids: Vec<VlessUuid>,
+    allow_private_egress: bool,
+    allow_smtp_port_25: bool,
+    dns_resolver: SocketAddr,
+    allow_system_dns: bool,
+}
+
+impl VlessConfig {
+    /// Constructs and validates a `VlessConfig`.
+    pub fn new(
+        uuids: Vec<VlessUuid>,
+        allow_private_egress: bool,
+        allow_smtp_port_25: bool,
+        dns_resolver: SocketAddr,
+        allow_system_dns: bool,
+    ) -> Result<Self, DaemonError> {
+        let cfg = Self {
+            uuids,
+            allow_private_egress,
+            allow_smtp_port_25,
+            dns_resolver,
+            allow_system_dns,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<(), DaemonError> {
+        if self.uuids.is_empty() {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        Ok(())
+    }
+
+    /// Returns configured VLESS client UUIDs.
+    #[must_use]
+    pub fn uuids(&self) -> &[VlessUuid] {
+        &self.uuids
+    }
+
+    /// Returns whether private/internal egress IPs are permitted (default `false`).
+    #[must_use]
+    pub const fn allow_private_egress(&self) -> bool {
+        self.allow_private_egress
+    }
+
+    /// Returns whether outbound TCP port 25 is permitted (default `false`).
+    #[must_use]
+    pub const fn allow_smtp_port_25(&self) -> bool {
+        self.allow_smtp_port_25
+    }
+
+    /// Returns the configured private recursive DNS resolver address.
+    #[must_use]
+    pub const fn dns_resolver(&self) -> SocketAddr {
+        self.dns_resolver
+    }
+
+    /// Returns whether opt-in system DNS fallback is permitted (default `false`).
+    #[must_use]
+    pub const fn allow_system_dns(&self) -> bool {
+        self.allow_system_dns
+    }
+}
+
+impl fmt::Debug for VlessConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VlessConfig")
+            .field("uuids_count", &self.uuids.len())
+            .field("allow_private_egress", &self.allow_private_egress)
+            .field("allow_smtp_port_25", &self.allow_smtp_port_25)
+            .field("allow_system_dns", &self.allow_system_dns)
+            .finish()
+    }
 }
 
 /// Validated Reality authentication & replay-protection configuration.
@@ -258,6 +394,7 @@ pub struct Config {
     max_connections: usize,
     unsafe_debug_logging: bool,
     reality: Option<RealityConfig>,
+    vless: Option<VlessConfig>,
 }
 
 impl Config {
@@ -280,6 +417,7 @@ impl Config {
             max_connections,
             unsafe_debug_logging,
             reality: None,
+            vless: None,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -289,6 +427,13 @@ impl Config {
     pub fn with_reality(mut self, reality: RealityConfig) -> Result<Self, DaemonError> {
         reality.validate()?;
         self.reality = Some(reality);
+        Ok(self)
+    }
+
+    /// Attaches a validated `VlessConfig` to this configuration.
+    pub fn with_vless(mut self, vless: VlessConfig) -> Result<Self, DaemonError> {
+        vless.validate()?;
+        self.vless = Some(vless);
         Ok(self)
     }
 
@@ -327,6 +472,17 @@ impl Config {
                 rc.max_client_ver,
             )?;
             cfg = cfg.with_reality(validated_rc)?;
+        }
+        if let Some(vc) = raw.vless {
+            let uuids = vc.uuids.into_iter().map(|u| u.0).collect();
+            let validated_vc = VlessConfig::new(
+                uuids,
+                vc.allow_private_egress,
+                vc.allow_smtp_port_25,
+                vc.dns_resolver,
+                vc.allow_system_dns,
+            )?;
+            cfg = cfg.with_vless(validated_vc)?;
         }
         Ok(cfg)
     }
@@ -407,6 +563,12 @@ impl Config {
     pub fn reality(&self) -> Option<&RealityConfig> {
         self.reality.as_ref()
     }
+
+    /// Returns the optional VLESS configuration.
+    #[must_use]
+    pub fn vless(&self) -> Option<&VlessConfig> {
+        self.vless.as_ref()
+    }
 }
 
 impl fmt::Debug for Config {
@@ -420,6 +582,7 @@ impl fmt::Debug for Config {
             .field("max_connections", &self.max_connections)
             .field("unsafe_debug_logging", &self.unsafe_debug_logging)
             .field("reality_enabled", &self.reality.is_some())
+            .field("vless_enabled", &self.vless.is_some())
             .finish()
     }
 }

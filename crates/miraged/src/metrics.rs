@@ -16,6 +16,11 @@ pub struct Metrics {
     reality_replayed_or_saturated: AtomicU64,
     reality_dest_profile_fallback: AtomicU64,
     reality_handshake_completed: AtomicU64,
+    vless_tcp_sessions: AtomicU64,
+    vless_udp_sessions: AtomicU64,
+    vless_auth_failed: AtomicU64,
+    egress_blocked: AtomicU64,
+    vision_direct_switches: AtomicU64,
 }
 
 impl Metrics {
@@ -72,6 +77,26 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn inc_vless_tcp_sessions(&self) {
+        self.vless_tcp_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_vless_udp_sessions(&self) {
+        self.vless_udp_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_vless_auth_failed(&self) {
+        self.vless_auth_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_egress_blocked(&self) {
+        self.egress_blocked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_vision_direct_switches(&self) {
+        self.vision_direct_switches.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn accepted(&self) -> u64 {
         self.accepted.load(Ordering::Relaxed)
@@ -125,5 +150,30 @@ impl Metrics {
     #[must_use]
     pub fn reality_handshake_completed(&self) -> u64 {
         self.reality_handshake_completed.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn vless_tcp_sessions(&self) -> u64 {
+        self.vless_tcp_sessions.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn vless_udp_sessions(&self) -> u64 {
+        self.vless_udp_sessions.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn vless_auth_failed(&self) -> u64 {
+        self.vless_auth_failed.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn egress_blocked(&self) -> u64 {
+        self.egress_blocked.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn vision_direct_switches(&self) -> u64 {
+        self.vision_direct_switches.load(Ordering::Relaxed)
     }
 }
