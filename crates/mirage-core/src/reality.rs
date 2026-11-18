@@ -284,59 +284,141 @@ impl fmt::Debug for RealityTlsSession {
     }
 }
 
+/// Independent read half of an active `RealityTlsSession`.
+pub struct RealityTlsReader {
+    client_app: Tls13RecordCipher,
+    read_buf: Vec<u8>,
+}
+
+impl RealityTlsReader {
+    /// Appends raw incoming wire bytes to the read buffer.
+    pub fn push_wire_bytes(&mut self, incoming: &[u8]) {
+        self.read_buf.extend_from_slice(incoming);
+    }
+
+    /// Consumes and decrypts at most ONE complete outer TLS 1.3 record.
+    pub fn next_record(&mut self) -> Result<Option<(u8, Vec<u8>)>, CryptoError> {
+        if self.read_buf.len() < 5 {
+            return Ok(None);
+        }
+        let ct = *self.read_buf.first().ok_or(CryptoError::InvalidRecord)?;
+        if ct != 0x17 {
+            return Err(CryptoError::InvalidRecord);
+        }
+        let b3 = *self.read_buf.get(3).ok_or(CryptoError::InvalidRecord)?;
+        let b4 = *self.read_buf.get(4).ok_or(CryptoError::InvalidRecord)?;
+        let frag_len = usize::from(u16::from_be_bytes([b3, b4]));
+        let rec_total = 5usize
+            .checked_add(frag_len)
+            .ok_or(CryptoError::InvalidRecord)?;
+        let Some(rec) = self.read_buf.get(..rec_total) else {
+            return Ok(None);
+        };
+        let (inner_ct, payload) = self.client_app.open_record(rec)?;
+        self.read_buf.drain(..rec_total);
+        Ok(Some((inner_ct, payload)))
+    }
+
+    /// Consumes the reader and returns any unparsed raw wire bytes (for Vision direct switch).
+    #[must_use]
+    pub fn into_remaining_wire_bytes(mut self) -> Vec<u8> {
+        core::mem::take(&mut self.read_buf)
+    }
+}
+
+/// Independent write half of an active `RealityTlsSession`.
+pub struct RealityTlsWriter {
+    server_app: Tls13RecordCipher,
+}
+
+impl RealityTlsWriter {
+    /// Encrypts application data into a TLS 1.3 `0x17` record.
+    pub fn seal_app_data(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.server_app.seal_record(0x17, plaintext, None)
+    }
+}
+
 impl RealityTlsSession {
+    /// Splits this session into independent read and write halves for concurrent
+    /// lock-free uplink/downlink relaying.
+    #[must_use]
+    pub fn into_split(self) -> (RealityTlsReader, RealityTlsWriter) {
+        (
+            RealityTlsReader {
+                client_app: self.client_app,
+                read_buf: self.read_buf,
+            },
+            RealityTlsWriter {
+                server_app: self.server_app,
+            },
+        )
+    }
+
     /// Encrypts application data into a TLS 1.3 `0x17` record.
     pub fn seal_app_data(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.server_app.seal_record(0x17, plaintext, None)
     }
 
-    /// Feeds raw incoming TLS wire bytes and extracts complete decrypted records.
+    /// Appends raw incoming wire bytes to the session read buffer.
+    pub fn push_wire_bytes(&mut self, incoming: &[u8]) {
+        self.read_buf.extend_from_slice(incoming);
+    }
+
+    /// Consumes and decrypts at most ONE complete outer TLS 1.3 record from the
+    /// read buffer, leaving any subsequent raw/encrypted bytes intact.
+    ///
+    /// Returns `Ok(Some((inner_content_type, plaintext)))` or `Ok(None)` if
+    /// more wire bytes are needed.
+    pub fn next_record(&mut self) -> Result<Option<(u8, Vec<u8>)>, CryptoError> {
+        if self.read_buf.len() < 5 {
+            return Ok(None);
+        }
+        let ct = *self.read_buf.first().ok_or(CryptoError::InvalidRecord)?;
+        if ct != 0x17 {
+            return Err(CryptoError::InvalidRecord);
+        }
+        let b3 = *self.read_buf.get(3).ok_or(CryptoError::InvalidRecord)?;
+        let b4 = *self.read_buf.get(4).ok_or(CryptoError::InvalidRecord)?;
+        let frag_len = usize::from(u16::from_be_bytes([b3, b4]));
+        let rec_total = 5usize
+            .checked_add(frag_len)
+            .ok_or(CryptoError::InvalidRecord)?;
+        let Some(rec) = self.read_buf.get(..rec_total) else {
+            return Ok(None);
+        };
+        let (inner_ct, payload) = self.client_app.open_record(rec)?;
+        self.read_buf.drain(..rec_total);
+        Ok(Some((inner_ct, payload)))
+    }
+
+    /// Consumes the session and returns any remaining unparsed raw wire bytes
+    /// (used when XTLS-Vision switches uplink to `DirectCopy`).
+    #[must_use]
+    pub fn into_remaining_wire_bytes(mut self) -> Vec<u8> {
+        core::mem::take(&mut self.read_buf)
+    }
+
+    /// Feeds raw incoming TLS wire bytes and extracts all complete decrypted
+    /// records currently buffered.
     /// Returns `(application_data_chunks, peer_close_notify)`.
     pub fn feed_wire_bytes(&mut self, incoming: &[u8]) -> Result<(Vec<u8>, bool), CryptoError> {
-        self.read_buf.extend_from_slice(incoming);
+        self.push_wire_bytes(incoming);
         let mut app_out = Vec::new();
         let mut close_notify = false;
-        let mut consumed = 0usize;
 
-        while let Some(rem) = self.read_buf.get(consumed..) {
-            if rem.len() < 5 {
-                break;
-            }
-            let ct = *rem.first().ok_or(CryptoError::InvalidRecord)?;
-            if ct != 0x17 {
-                return Err(CryptoError::InvalidRecord);
-            }
-            let b3 = *rem.get(3).ok_or(CryptoError::InvalidRecord)?;
-            let b4 = *rem.get(4).ok_or(CryptoError::InvalidRecord)?;
-            let frag_len = usize::from(u16::from_be_bytes([b3, b4]));
-            let rec_total = 5usize
-                .checked_add(frag_len)
-                .ok_or(CryptoError::InvalidRecord)?;
-            let Some(rec) = rem.get(..rec_total) else {
-                break;
-            };
-            let (inner_ct, payload) = self.client_app.open_record(rec)?;
+        while let Some((inner_ct, payload)) = self.next_record()? {
             match inner_ct {
                 0x17 => app_out.extend_from_slice(&payload),
                 0x15 => {
-                    // TLS Alert: close_notify is level=1, desc=0
                     if payload.get(1) == Some(&0) {
                         close_notify = true;
                     }
                 }
-                0x16 => {
-                    // Ignore post-handshake messages such as KeyUpdate/NewSessionTicket if any.
-                }
+                0x16 => {}
                 _ => return Err(CryptoError::InvalidRecord),
             }
-            consumed = consumed
-                .checked_add(rec_total)
-                .ok_or(CryptoError::InvalidRecord)?;
         }
 
-        if consumed > 0 {
-            self.read_buf.drain(..consumed);
-        }
         Ok((app_out, close_notify))
     }
 }
@@ -584,16 +666,10 @@ impl RealityPendingHandshake {
                 server_app,
                 client_app,
                 cipher_suite: self.cipher_suite,
-                read_buf: Vec::new(),
+                read_buf: trailing,
             };
-            let initial_app_data = if trailing.is_empty() {
-                Vec::new()
-            } else {
-                match session.feed_wire_bytes(&trailing) {
-                    Ok((app, _)) => app,
-                    Err(_) => return ClientFlightStatus::Failed,
-                }
-            };
+            let initial_app_data = Vec::new();
+            let _ = &mut session;
 
             return ClientFlightStatus::Complete {
                 session: Box::new(session),
