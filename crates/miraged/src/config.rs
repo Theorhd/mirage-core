@@ -36,14 +36,14 @@ impl<'de> Deserialize<'de> for DeserializedPrivateKey {
             type Value = DeserializedPrivateKey;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a 64-character hex-encoded X25519 private key")
+                f.write_str("a 64-character hex or 43-character Base64url X25519 private key")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
             where
                 E: de::Error,
             {
-                StaticPrivateKey::from_hex(value)
+                StaticPrivateKey::from_encoded(value)
                     .map(DeserializedPrivateKey)
                     .map_err(|_| de::Error::custom("invalid private key"))
             }
