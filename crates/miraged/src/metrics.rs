@@ -11,6 +11,11 @@ pub struct Metrics {
     timeout_delegated: AtomicU64,
     oversize_delegated: AtomicU64,
     dial_dest_failed: AtomicU64,
+    reality_authenticated: AtomicU64,
+    reality_auth_failed: AtomicU64,
+    reality_replayed_or_saturated: AtomicU64,
+    reality_dest_profile_fallback: AtomicU64,
+    reality_handshake_completed: AtomicU64,
 }
 
 impl Metrics {
@@ -44,6 +49,29 @@ impl Metrics {
         self.dial_dest_failed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn inc_reality_authenticated(&self) {
+        self.reality_authenticated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_reality_auth_failed(&self) {
+        self.reality_auth_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_reality_replayed_or_saturated(&self) {
+        self.reality_replayed_or_saturated
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_reality_dest_profile_fallback(&self) {
+        self.reality_dest_profile_fallback
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_reality_handshake_completed(&self) {
+        self.reality_handshake_completed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn accepted(&self) -> u64 {
         self.accepted.load(Ordering::Relaxed)
@@ -72,5 +100,30 @@ impl Metrics {
     #[must_use]
     pub fn dial_dest_failed(&self) -> u64 {
         self.dial_dest_failed.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn reality_authenticated(&self) -> u64 {
+        self.reality_authenticated.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn reality_auth_failed(&self) -> u64 {
+        self.reality_auth_failed.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn reality_replayed_or_saturated(&self) -> u64 {
+        self.reality_replayed_or_saturated.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn reality_dest_profile_fallback(&self) -> u64 {
+        self.reality_dest_profile_fallback.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn reality_handshake_completed(&self) -> u64 {
+        self.reality_handshake_completed.load(Ordering::Relaxed)
     }
 }

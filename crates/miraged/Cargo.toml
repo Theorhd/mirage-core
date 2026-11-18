@@ -10,6 +10,7 @@ description = "Hardened async Tokio daemon for mirage-core"
 [dependencies]
 mirage-core = { path = "../mirage-core" }
 bytes.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -19,6 +20,14 @@ zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+hmac.workspace = true
+ml-kem.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+x25519-dalek.workspace = true
 
 [lints]
 workspace = true

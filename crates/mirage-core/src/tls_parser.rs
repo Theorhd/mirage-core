@@ -37,6 +37,27 @@ const X25519_KEY_SHARE_LEN: usize = 32;
 /// Expected client key share length for X25519MLKEM768 (1184-byte ML-KEM-768 + 32-byte X25519).
 const X25519_MLKEM768_KEY_SHARE_LEN: usize = 1216;
 
+/// ML-KEM-768 encapsulation key prefix length inside `X25519MLKEM768` client share.
+const MLKEM768_EK_LEN: usize = 1184;
+
+/// Expected server key share length for `X25519MLKEM768` (1088-byte ciphertext + 32-byte X25519).
+const X25519_MLKEM768_SERVER_SHARE_LEN: usize = 1120;
+
+/// TLS record content type for ChangeCipherSpec.
+const TLS_CONTENT_TYPE_CCS: u8 = 0x14;
+
+/// TLS record content type for ApplicationData (encrypted TLS 1.3 records).
+const TLS_CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
+
+/// TLS handshake message type for `ServerHello`.
+const TLS_HANDSHAKE_SERVER_HELLO: u8 = 0x02;
+
+/// TLS 1.3 `HelloRetryRequest` special random value (RFC 8446 §4.1.3).
+const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+];
+
 /// TLS 1.3 protocol version wire value (`0x0304`).
 const TLS_VERSION_1_3: u16 = 0x0304;
 
@@ -148,12 +169,35 @@ impl core::fmt::Debug for SniHost {
 }
 
 /// Key shares extracted from the TLS `key_share` extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KeyShares {
     /// Classical X25519 ephemeral public key (`0x001d`), if offered.
     pub x25519: Option<[u8; 32]>,
-    /// Whether the hybrid post-quantum group `X25519MLKEM768` (`0x11ec`) was offered.
-    pub offers_x25519_mlkem768: bool,
+    /// Full hybrid post-quantum share `X25519MLKEM768` (`0x11ec`), if offered.
+    pub x25519_mlkem768: Option<Box<[u8; X25519_MLKEM768_KEY_SHARE_LEN]>>,
+}
+
+impl KeyShares {
+    /// Returns `true` if `X25519MLKEM768` (`0x11ec`) was offered by the client.
+    #[must_use]
+    pub const fn offers_x25519_mlkem768(&self) -> bool {
+        self.x25519_mlkem768.is_some()
+    }
+
+    /// Returns the 32-byte client X25519 public key used for Reality `AuthKey`
+    /// derivation: prefers standalone `X25519` (`0x001d`), falling back to the
+    /// X25519 tail of `X25519MLKEM768` (`[1184..1216]`).
+    #[must_use]
+    pub fn reality_auth_x25519_pubkey(&self) -> Option<[u8; 32]> {
+        if let Some(pk) = self.x25519 {
+            return Some(pk);
+        }
+        let hybrid = self.x25519_mlkem768.as_ref()?;
+        let tail = hybrid.get(MLKEM768_EK_LEN..)?;
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(tail);
+        Some(pk)
+    }
 }
 
 /// Parsed fields of a TLS `ClientHello` required for SNI routing and Reality auth.
@@ -173,6 +217,8 @@ pub struct ClientHelloInfo {
     pub offers_tls13: bool,
     /// Total TLS wire bytes consumed by the record(s) forming this `ClientHello`.
     pub wire_bytes_len: usize,
+    /// Reassembled TLS handshake message (`0x01 || u24_len || body`, without 5-byte record headers).
+    pub handshake_raw: Vec<u8>,
 }
 
 impl ClientHelloInfo {
@@ -186,6 +232,25 @@ impl ClientHelloInfo {
         server_names
             .iter()
             .any(|allowed| sni.matches_ascii_case_insensitive(allowed))
+    }
+
+    /// Builds the Reality AEAD Additional Authenticated Data (AAD) by cloning
+    /// `handshake_raw` and zeroing the 32-byte `SessionId` field at bytes
+    /// `39..71`. Returns `None` if `session_id.len() != 32` or the layout is
+    /// shorter than 71 bytes.
+    #[must_use]
+    pub fn build_reality_aad(&self) -> Option<Vec<u8>> {
+        if self.session_id.len() != 32 {
+            return None;
+        }
+        // 1 (msg_type) + 3 (hs_len) + 2 (legacy_version) + 32 (random) + 1 (sid_len) = 39
+        if self.handshake_raw.get(38) != Some(&32) {
+            return None;
+        }
+        let mut aad = self.handshake_raw.clone();
+        let sid_slot = aad.get_mut(39..71)?;
+        sid_slot.fill(0);
+        Some(aad)
     }
 }
 
@@ -250,10 +315,13 @@ pub fn inspect_client_hello(buf: &[u8], max_bytes: usize) -> InspectOutcome {
         }
 
         if first_fragment.len() >= hs_total {
+            let Some(handshake_raw) = first_fragment.get(..hs_total) else {
+                return InspectOutcome::Fallback(FallbackReason::Malformed);
+            };
             let Some(body) = first_fragment.get(4..hs_total) else {
                 return InspectOutcome::Fallback(FallbackReason::Malformed);
             };
-            return match parse_client_hello_body(body, first_record_end) {
+            return match parse_client_hello_body(handshake_raw, body, first_record_end) {
                 Ok(info) => InspectOutcome::ClientHello(Box::new(info)),
                 Err(reason) => InspectOutcome::Fallback(reason),
             };
@@ -404,10 +472,13 @@ fn reassemble_and_parse(buf: &[u8], max_bytes: usize) -> InspectOutcome {
 
         if let Some(hs_total) = expected_hs_total {
             if reassembled.len() >= hs_total {
+                let Some(handshake_raw) = reassembled.get(..hs_total) else {
+                    return InspectOutcome::Fallback(FallbackReason::Malformed);
+                };
                 let Some(body) = reassembled.get(4..hs_total) else {
                     return InspectOutcome::Fallback(FallbackReason::Malformed);
                 };
-                return match parse_client_hello_body(body, offset) {
+                return match parse_client_hello_body(handshake_raw, body, offset) {
                     Ok(info) => InspectOutcome::ClientHello(Box::new(info)),
                     Err(reason) => InspectOutcome::Fallback(reason),
                 };
@@ -425,6 +496,7 @@ fn read_u24_at(buf: &[u8], start: usize) -> Option<usize> {
 }
 
 fn parse_client_hello_body(
+    handshake_raw: &[u8],
     body: &[u8],
     wire_bytes_len: usize,
 ) -> Result<ClientHelloInfo, FallbackReason> {
@@ -522,6 +594,7 @@ fn parse_client_hello_body(
         key_shares,
         offers_tls13,
         wire_bytes_len,
+        handshake_raw: handshake_raw.to_vec(),
     })
 }
 
@@ -570,10 +643,13 @@ fn parse_key_share_extension(ext_data: &[u8]) -> Result<KeyShares, FallbackReaso
             key.copy_from_slice(key_bytes);
             shares.x25519 = Some(key);
         } else if group == GROUP_X25519_MLKEM768 {
-            if shares.offers_x25519_mlkem768 || key_bytes.len() != X25519_MLKEM768_KEY_SHARE_LEN {
+            if shares.x25519_mlkem768.is_some() || key_bytes.len() != X25519_MLKEM768_KEY_SHARE_LEN
+            {
                 return Err(FallbackReason::Malformed);
             }
-            shares.offers_x25519_mlkem768 = true;
+            let mut key = Box::new([0u8; X25519_MLKEM768_KEY_SHARE_LEN]);
+            key.copy_from_slice(key_bytes);
+            shares.x25519_mlkem768 = Some(key);
         }
     }
 
@@ -641,6 +717,314 @@ impl<'a> SliceReader<'a> {
         out.copy_from_slice(slice);
         Ok(out)
     }
+}
+
+/// Supported TLS 1.3 cipher suites for Reality handshake mimicry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tls13CipherSuiteId {
+    /// `TLS_AES_128_GCM_SHA256` (`0x1301`)
+    Aes128GcmSha256,
+    /// `TLS_AES_256_GCM_SHA384` (`0x1302`)
+    Aes256GcmSha384,
+    /// `TLS_CHACHA20_POLY1305_SHA256` (`0x1303`)
+    ChaCha20Poly1305Sha256,
+}
+
+impl Tls13CipherSuiteId {
+    /// Parses a wire cipher suite identifier.
+    #[must_use]
+    pub const fn from_u16(raw: u16) -> Option<Self> {
+        match raw {
+            0x1301 => Some(Self::Aes128GcmSha256),
+            0x1302 => Some(Self::Aes256GcmSha384),
+            0x1303 => Some(Self::ChaCha20Poly1305Sha256),
+            _ => None,
+        }
+    }
+
+    /// Returns the wire 16-bit cipher suite ID.
+    #[must_use]
+    pub const fn to_u16(self) -> u16 {
+        match self {
+            Self::Aes128GcmSha256 => 0x1301,
+            Self::Aes256GcmSha384 => 0x1302,
+            Self::ChaCha20Poly1305Sha256 => 0x1303,
+        }
+    }
+}
+
+/// Supported TLS 1.3 key-exchange groups selected by `dest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedGroup {
+    /// Classical X25519 (`0x001d`, 32-byte server share).
+    X25519,
+    /// Post-quantum hybrid `X25519MLKEM768` (`0x11ec`, 1120-byte server share).
+    X25519MlKem768,
+}
+
+/// Handshake profile learned from `dest`'s server flight for authenticated-path mimicry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestServerProfile {
+    /// Raw `ServerHello` handshake message (`0x02 || u24_len || body`) from `dest`.
+    pub server_hello_raw: Vec<u8>,
+    /// Byte offset inside `server_hello_raw` where the `key_exchange` bytes begin.
+    pub key_exchange_offset: usize,
+    /// Length of the `key_exchange` bytes inside `server_hello_raw` (32 or 1120).
+    pub key_exchange_len: usize,
+    /// Negotiated TLS 1.3 cipher suite.
+    pub cipher_suite: Tls13CipherSuiteId,
+    /// Negotiated key-exchange group.
+    pub selected_group: SelectedGroup,
+    /// Whether `dest` sent a middlebox-compatibility `ChangeCipherSpec` record.
+    pub send_ccs: bool,
+    /// Recorded encrypted handshake wire record lengths:
+    /// `[EncryptedExtensions, Certificate, CertificateVerify, Finished, NewSessionTicket]`.
+    pub encrypted_record_lens: [usize; 5],
+}
+
+/// Result of inspecting `dest`'s server flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerFlightStatus {
+    /// More bytes are needed to finish parsing `ServerHello` or handshake records.
+    NeedMoreData,
+    /// `ServerHello` and at least one encrypted handshake record were parsed,
+    /// though fewer than 4 separate `0x17` records have arrived so far.
+    PartialWithProfile(Box<DestServerProfile>),
+    /// `ServerHello` and all 4 encrypted handshake records (plus optional NST) arrived.
+    Complete(Box<DestServerProfile>),
+    /// `dest` returned non-TLS 1.3, `HelloRetryRequest`, unsupported suite/group, or malformed bytes.
+    Invalid,
+}
+
+/// Parses `dest`'s server flight (`ServerHello` + optional `ChangeCipherSpec` +
+/// encrypted TLS 1.3 handshake records) without mutating `buf`.
+#[must_use]
+pub fn parse_dest_server_flight(buf: &[u8]) -> ServerFlightStatus {
+    if buf.len() < 5 {
+        return ServerFlightStatus::NeedMoreData;
+    }
+
+    let Ok(sh_hdr) = validate_record_header(buf.get(..5).unwrap_or(&[])) else {
+        return ServerFlightStatus::Invalid;
+    };
+    let Some(sh_rec_end) = 5usize.checked_add(sh_hdr.fragment_len) else {
+        return ServerFlightStatus::Invalid;
+    };
+    let Some(sh_payload) = buf.get(5..sh_rec_end) else {
+        return ServerFlightStatus::NeedMoreData;
+    };
+    if sh_payload.first() != Some(&TLS_HANDSHAKE_SERVER_HELLO) {
+        return ServerFlightStatus::Invalid;
+    }
+    let Some(sh_hs_len) = read_u24_at(sh_payload, 1) else {
+        return ServerFlightStatus::Invalid;
+    };
+    let Some(sh_hs_total) = 4usize.checked_add(sh_hs_len) else {
+        return ServerFlightStatus::Invalid;
+    };
+    let Some(sh_raw) = sh_payload.get(..sh_hs_total) else {
+        return ServerFlightStatus::Invalid;
+    };
+    let Some(sh_body) = sh_payload.get(4..sh_hs_total) else {
+        return ServerFlightStatus::Invalid;
+    };
+
+    let Ok(parsed_sh) = parse_server_hello_body(sh_body, sh_raw) else {
+        return ServerFlightStatus::Invalid;
+    };
+
+    let mut offset = sh_rec_end;
+    let mut send_ccs = false;
+    let mut encrypted_record_lens = [0usize; 5];
+    let mut enc_count = 0usize;
+
+    while let Some(rem) = buf.get(offset..) {
+        if rem.is_empty() {
+            break;
+        }
+        let Some(hdr) = rem.get(..5) else {
+            break;
+        };
+        let ct = *hdr.first().unwrap_or(&0);
+        let major = *hdr.get(1).unwrap_or(&0);
+        let minor = *hdr.get(2).unwrap_or(&0);
+        let b3 = *hdr.get(3).unwrap_or(&0);
+        let b4 = *hdr.get(4).unwrap_or(&0);
+        if major != 0x03 || minor > 0x04 {
+            return ServerFlightStatus::Invalid;
+        }
+        let frag_len = usize::from(u16::from_be_bytes([b3, b4]));
+        if frag_len == 0 || frag_len > MAX_TLS_RECORD_FRAGMENT.saturating_add(256) {
+            return ServerFlightStatus::Invalid;
+        }
+        let Some(rec_total) = 5usize.checked_add(frag_len) else {
+            return ServerFlightStatus::Invalid;
+        };
+        if rem.len() < rec_total {
+            break;
+        }
+
+        if ct == TLS_CONTENT_TYPE_CCS {
+            if send_ccs || enc_count > 0 || rec_total != 6 {
+                return ServerFlightStatus::Invalid;
+            }
+            send_ccs = true;
+        } else if ct == TLS_CONTENT_TYPE_APPLICATION_DATA {
+            if let Some(slot) = encrypted_record_lens.get_mut(enc_count) {
+                *slot = rec_total;
+                enc_count = enc_count.saturating_add(1);
+            } else {
+                break;
+            }
+        } else {
+            return ServerFlightStatus::Invalid;
+        }
+
+        let Some(next_offset) = offset.checked_add(rec_total) else {
+            break;
+        };
+        offset = next_offset;
+        if enc_count >= 5 {
+            break;
+        }
+    }
+
+    let profile = DestServerProfile {
+        server_hello_raw: sh_raw.to_vec(),
+        key_exchange_offset: parsed_sh.key_exchange_offset,
+        key_exchange_len: parsed_sh.key_exchange_len,
+        cipher_suite: parsed_sh.cipher_suite,
+        selected_group: parsed_sh.selected_group,
+        send_ccs,
+        encrypted_record_lens,
+    };
+
+    if enc_count >= 4 {
+        ServerFlightStatus::Complete(Box::new(profile))
+    } else if enc_count >= 1 {
+        ServerFlightStatus::PartialWithProfile(Box::new(profile))
+    } else {
+        ServerFlightStatus::NeedMoreData
+    }
+}
+
+struct ParsedServerHello {
+    cipher_suite: Tls13CipherSuiteId,
+    selected_group: SelectedGroup,
+    key_exchange_offset: usize,
+    key_exchange_len: usize,
+}
+
+fn parse_server_hello_body(
+    body: &[u8],
+    sh_raw: &[u8],
+) -> Result<ParsedServerHello, FallbackReason> {
+    let mut r = SliceReader::new(body);
+    let legacy_version = r.read_u16()?;
+    if legacy_version != 0x0303 {
+        return Err(FallbackReason::Malformed);
+    }
+
+    let random = r.read_array::<32>()?;
+    if random == HELLO_RETRY_REQUEST_RANDOM {
+        return Err(FallbackReason::Malformed);
+    }
+
+    let sid_len = usize::from(r.read_u8()?);
+    if sid_len > 32 {
+        return Err(FallbackReason::Malformed);
+    }
+    let _ = r.read_slice(sid_len)?;
+
+    let cs_raw = r.read_u16()?;
+    let cipher_suite = Tls13CipherSuiteId::from_u16(cs_raw).ok_or(FallbackReason::Malformed)?;
+
+    let comp = r.read_u8()?;
+    if comp != 0 {
+        return Err(FallbackReason::Malformed);
+    }
+
+    let ext_len = usize::from(r.read_u16()?);
+    let ext_slice = r.read_slice(ext_len)?;
+    if !r.is_empty() {
+        return Err(FallbackReason::Malformed);
+    }
+
+    // Track exact start offset of `ext_slice` within `sh_raw` (4-byte handshake header + body prefix).
+    let ext_base_in_body = body
+        .len()
+        .checked_sub(ext_len)
+        .ok_or(FallbackReason::Malformed)?;
+    let ext_base_in_sh = 4usize
+        .checked_add(ext_base_in_body)
+        .ok_or(FallbackReason::Malformed)?;
+
+    let mut er = SliceReader::new(ext_slice);
+    let mut is_tls13 = false;
+    let mut key_share_info: Option<(SelectedGroup, usize, usize)> = None;
+
+    while !er.is_empty() {
+        let ext_type = er.read_u16()?;
+        let data_len = usize::from(er.read_u16()?);
+        let data_offset_in_ext = ext_slice
+            .len()
+            .checked_sub(er.remaining())
+            .ok_or(FallbackReason::Malformed)?;
+        let ext_data = er.read_slice(data_len)?;
+
+        if ext_type == EXT_SUPPORTED_VERSIONS {
+            if ext_data.len() != 2 {
+                return Err(FallbackReason::Malformed);
+            }
+            let b0 = *ext_data.first().ok_or(FallbackReason::Malformed)?;
+            let b1 = *ext_data.get(1).ok_or(FallbackReason::Malformed)?;
+            if u16::from_be_bytes([b0, b1]) != TLS_VERSION_1_3 {
+                return Err(FallbackReason::Malformed);
+            }
+            is_tls13 = true;
+        } else if ext_type == EXT_KEY_SHARE {
+            let mut kr = SliceReader::new(ext_data);
+            let group_raw = kr.read_u16()?;
+            let key_len = usize::from(kr.read_u16()?);
+            let _ = kr.read_slice(key_len)?;
+            if !kr.is_empty() {
+                return Err(FallbackReason::Malformed);
+            }
+
+            let group = match (group_raw, key_len) {
+                (GROUP_X25519, X25519_KEY_SHARE_LEN) => SelectedGroup::X25519,
+                (GROUP_X25519_MLKEM768, X25519_MLKEM768_SERVER_SHARE_LEN) => {
+                    SelectedGroup::X25519MlKem768
+                }
+                _ => return Err(FallbackReason::Malformed),
+            };
+            // Inside `key_share` ServerHello extension: 2 (group) + 2 (key_len) = 4 bytes before key bytes.
+            let key_offset = ext_base_in_sh
+                .checked_add(data_offset_in_ext)
+                .and_then(|v| v.checked_add(4))
+                .ok_or(FallbackReason::Malformed)?;
+            let key_end = key_offset
+                .checked_add(key_len)
+                .ok_or(FallbackReason::Malformed)?;
+            if sh_raw.get(key_offset..key_end).is_none() {
+                return Err(FallbackReason::Malformed);
+            }
+            key_share_info = Some((group, key_offset, key_len));
+        }
+    }
+
+    if !is_tls13 {
+        return Err(FallbackReason::Malformed);
+    }
+    let (selected_group, key_exchange_offset, key_exchange_len) =
+        key_share_info.ok_or(FallbackReason::Malformed)?;
+
+    Ok(ParsedServerHello {
+        cipher_suite,
+        selected_group,
+        key_exchange_offset,
+        key_exchange_len,
+    })
 }
 
 #[cfg(test)]
@@ -750,9 +1134,14 @@ mod tests {
                 assert!(info.matches_any_server_name(&["example.com".to_owned()]));
                 assert!(!info.matches_any_server_name(&["sub.example.com".to_owned()]));
                 assert_eq!(info.key_shares.x25519, Some(x25519));
-                assert!(!info.key_shares.offers_x25519_mlkem768);
+                assert!(!info.key_shares.offers_x25519_mlkem768());
                 assert!(info.offers_tls13);
                 assert_eq!(info.wire_bytes_len, wire.len());
+                let aad = info.build_reality_aad();
+                assert!(aad.is_some());
+                if let Some(a) = aad {
+                    assert_eq!(a.get(39..71), Some([0u8; 32].as_slice()));
+                }
             }
             other => {
                 assert!(
@@ -791,7 +1180,8 @@ mod tests {
                     Some("pq.example.org")
                 );
                 assert_eq!(info.key_shares.x25519, Some(x25519));
-                assert!(info.key_shares.offers_x25519_mlkem768);
+                assert!(info.key_shares.offers_x25519_mlkem768());
+                assert_eq!(info.key_shares.reality_auth_x25519_pubkey(), Some(x25519));
                 assert!(info.offers_tls13);
                 assert_eq!(info.wire_bytes_len, wire.len());
             }
