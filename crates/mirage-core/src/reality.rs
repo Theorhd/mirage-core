@@ -5,13 +5,17 @@ use core::fmt;
 use std::collections::{BTreeMap, HashSet};
 
 use subtle::{Choice, ConstantTimeEq};
+use zeroize::Zeroize;
 
 use crate::crypto::{
     compute_tls13_server_key_exchange, decrypt_reality_session_id, derive_reality_auth_key,
     keyed_replay_tag, AuthKey, CryptoError, RealityCertTemplate, ShortId, StaticPrivateKey,
     Tls13RecordCipher, Tls13Secret, TranscriptHash,
 };
-use crate::tls_parser::{ClientHelloInfo, DestServerProfile, Tls13CipherSuiteId};
+use crate::tls_parser::{
+    ClientHelloInfo, DestServerProfile, OfferedAlpn, Tls13CipherSuiteId,
+    MAX_TLS_CIPHERTEXT_RECORD_LEN, MAX_TLS_RECORD_FRAGMENT,
+};
 
 /// Result of checking a `ClientHello.random` tag in the anti-replay cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,25 +31,34 @@ pub enum ReplayOutcome {
 /// Bounded, fail-closed, time-bucketed anti-replay cache.
 ///
 /// Stores only 16-byte `HMAC-SHA256(process_key, client_random)` tags so raw
-/// `ClientHello.random` values are never retained. Expired buckets are pruned
-/// wholesale; valid entries are never evicted early.
+/// `ClientHello.random` values are never retained. Uses a flat `HashSet` for
+/// $O(1)$ membership lookups alongside time-bucketed vectors so expired buckets
+/// are pruned wholesale and valid entries are never evicted early.
 pub struct ReplayCache {
-    hmac_key: [u8; 32],
+    hmac_key: Box<[u8; 32]>,
     window_secs: u64,
     max_entries: usize,
-    total_entries: usize,
-    buckets: BTreeMap<u64, HashSet<[u8; 16]>>,
+    active: HashSet<[u8; 16]>,
+    buckets: BTreeMap<u64, Vec<[u8; 16]>>,
+}
+
+impl Drop for ReplayCache {
+    fn drop(&mut self) {
+        self.hmac_key.zeroize();
+    }
 }
 
 impl ReplayCache {
     /// Creates a new bounded anti-replay cache.
     #[must_use]
-    pub fn new(hmac_key: [u8; 32], window_secs: u64, max_entries: usize) -> Self {
+    pub fn new(mut hmac_key: [u8; 32], window_secs: u64, max_entries: usize) -> Self {
+        let boxed_key = Box::new(hmac_key);
+        hmac_key.zeroize();
         Self {
-            hmac_key,
+            hmac_key: boxed_key,
             window_secs,
             max_entries,
-            total_entries: 0,
+            active: HashSet::new(),
             buckets: BTreeMap::new(),
         }
     }
@@ -63,39 +76,41 @@ impl ReplayCache {
         self.prune_expired(now_unix_secs);
 
         let tag = keyed_replay_tag(&self.hmac_key, client_random);
-        if self.buckets.values().any(|set| set.contains(&tag)) {
+        if self.active.contains(&tag) {
             return ReplayOutcome::Replayed;
         }
 
-        if self.total_entries >= self.max_entries {
+        if self.active.len() >= self.max_entries {
             return ReplayOutcome::Saturated;
         }
 
-        let bucket = self.buckets.entry(now_unix_secs).or_default();
-        if bucket.insert(tag) {
-            self.total_entries = self.total_entries.saturating_add(1);
+        if self.active.insert(tag) {
+            self.buckets.entry(now_unix_secs).or_default().push(tag);
         }
         ReplayOutcome::Accepted
     }
 
     /// Returns the number of active entries currently tracked.
     #[must_use]
-    pub const fn len(&self) -> usize {
-        self.total_entries
+    pub fn len(&self) -> usize {
+        self.active.len()
     }
 
     /// Returns `true` if the cache has no active entries.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.total_entries == 0
+    pub fn is_empty(&self) -> bool {
+        self.active.is_empty()
     }
 
     fn prune_expired(&mut self, now_unix_secs: u64) {
         let cutoff = now_unix_secs.saturating_sub(self.window_secs);
         let retained = self.buckets.split_off(&cutoff);
         let expired = core::mem::replace(&mut self.buckets, retained);
-        let removed_count: usize = expired.values().map(HashSet::len).sum();
-        self.total_entries = self.total_entries.saturating_sub(removed_count);
+        for tags in expired.into_values() {
+            for tag in tags {
+                self.active.remove(&tag);
+            }
+        }
     }
 }
 
@@ -104,7 +119,7 @@ impl fmt::Debug for ReplayCache {
         f.debug_struct("ReplayCache")
             .field("window_secs", &self.window_secs)
             .field("max_entries", &self.max_entries)
-            .field("total_entries", &self.total_entries)
+            .field("total_entries", &self.active.len())
             .finish()
     }
 }
@@ -274,6 +289,7 @@ pub struct RealityTlsSession {
     client_app: Tls13RecordCipher,
     cipher_suite: Tls13CipherSuiteId,
     read_buf: Vec<u8>,
+    read_offset: usize,
 }
 
 impl fmt::Debug for RealityTlsSession {
@@ -288,40 +304,67 @@ impl fmt::Debug for RealityTlsSession {
 pub struct RealityTlsReader {
     client_app: Tls13RecordCipher,
     read_buf: Vec<u8>,
+    read_offset: usize,
 }
 
 impl RealityTlsReader {
     /// Appends raw incoming wire bytes to the read buffer.
     pub fn push_wire_bytes(&mut self, incoming: &[u8]) {
+        if self.read_offset >= self.read_buf.len() {
+            self.read_buf.clear();
+            self.read_offset = 0;
+        } else if self.read_offset >= 16 * 1024 {
+            self.read_buf.drain(..self.read_offset);
+            self.read_offset = 0;
+        }
         self.read_buf.extend_from_slice(incoming);
     }
 
     /// Consumes and decrypts at most ONE complete outer TLS 1.3 record.
     pub fn next_record(&mut self) -> Result<Option<(u8, Vec<u8>)>, CryptoError> {
-        if self.read_buf.len() < 5 {
+        let Some(avail) = self.read_buf.get(self.read_offset..) else {
+            self.read_buf.clear();
+            self.read_offset = 0;
+            return Ok(None);
+        };
+        if avail.len() < 5 {
             return Ok(None);
         }
-        let ct = *self.read_buf.first().ok_or(CryptoError::InvalidRecord)?;
+        let ct = *avail.first().ok_or(CryptoError::InvalidRecord)?;
         if ct != 0x17 {
             return Err(CryptoError::InvalidRecord);
         }
-        let b3 = *self.read_buf.get(3).ok_or(CryptoError::InvalidRecord)?;
-        let b4 = *self.read_buf.get(4).ok_or(CryptoError::InvalidRecord)?;
+        let b3 = *avail.get(3).ok_or(CryptoError::InvalidRecord)?;
+        let b4 = *avail.get(4).ok_or(CryptoError::InvalidRecord)?;
         let frag_len = usize::from(u16::from_be_bytes([b3, b4]));
+        if !(17..=MAX_TLS_CIPHERTEXT_RECORD_LEN).contains(&frag_len) {
+            return Err(CryptoError::InvalidRecord);
+        }
         let rec_total = 5usize
             .checked_add(frag_len)
             .ok_or(CryptoError::InvalidRecord)?;
-        let Some(rec) = self.read_buf.get(..rec_total) else {
+        let Some(rec) = avail.get(..rec_total) else {
             return Ok(None);
         };
         let (inner_ct, payload) = self.client_app.open_record(rec)?;
-        self.read_buf.drain(..rec_total);
+        self.read_offset = self.read_offset.saturating_add(rec_total);
+        if self.read_offset >= self.read_buf.len() {
+            self.read_buf.clear();
+            self.read_offset = 0;
+        }
         Ok(Some((inner_ct, payload)))
     }
 
     /// Consumes the reader and returns any unparsed raw wire bytes (for Vision direct switch).
     #[must_use]
     pub fn into_remaining_wire_bytes(mut self) -> Vec<u8> {
+        if self.read_offset > 0 {
+            if self.read_offset >= self.read_buf.len() {
+                self.read_buf.clear();
+            } else {
+                self.read_buf.drain(..self.read_offset);
+            }
+        }
         core::mem::take(&mut self.read_buf)
     }
 }
@@ -336,6 +379,15 @@ impl RealityTlsWriter {
     pub fn seal_app_data(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.server_app.seal_record(0x17, plaintext, None)
     }
+
+    /// Encrypts application data into a reusable buffer `out`, avoiding per-packet allocations.
+    pub fn seal_app_data_into(
+        &mut self,
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        self.server_app.seal_record_into(0x17, plaintext, None, out)
+    }
 }
 
 impl RealityTlsSession {
@@ -347,6 +399,7 @@ impl RealityTlsSession {
             RealityTlsReader {
                 client_app: self.client_app,
                 read_buf: self.read_buf,
+                read_offset: self.read_offset,
             },
             RealityTlsWriter {
                 server_app: self.server_app,
@@ -361,6 +414,13 @@ impl RealityTlsSession {
 
     /// Appends raw incoming wire bytes to the session read buffer.
     pub fn push_wire_bytes(&mut self, incoming: &[u8]) {
+        if self.read_offset >= self.read_buf.len() {
+            self.read_buf.clear();
+            self.read_offset = 0;
+        } else if self.read_offset >= 16 * 1024 {
+            self.read_buf.drain(..self.read_offset);
+            self.read_offset = 0;
+        }
         self.read_buf.extend_from_slice(incoming);
     }
 
@@ -370,24 +430,36 @@ impl RealityTlsSession {
     /// Returns `Ok(Some((inner_content_type, plaintext)))` or `Ok(None)` if
     /// more wire bytes are needed.
     pub fn next_record(&mut self) -> Result<Option<(u8, Vec<u8>)>, CryptoError> {
-        if self.read_buf.len() < 5 {
+        let Some(avail) = self.read_buf.get(self.read_offset..) else {
+            self.read_buf.clear();
+            self.read_offset = 0;
+            return Ok(None);
+        };
+        if avail.len() < 5 {
             return Ok(None);
         }
-        let ct = *self.read_buf.first().ok_or(CryptoError::InvalidRecord)?;
+        let ct = *avail.first().ok_or(CryptoError::InvalidRecord)?;
         if ct != 0x17 {
             return Err(CryptoError::InvalidRecord);
         }
-        let b3 = *self.read_buf.get(3).ok_or(CryptoError::InvalidRecord)?;
-        let b4 = *self.read_buf.get(4).ok_or(CryptoError::InvalidRecord)?;
+        let b3 = *avail.get(3).ok_or(CryptoError::InvalidRecord)?;
+        let b4 = *avail.get(4).ok_or(CryptoError::InvalidRecord)?;
         let frag_len = usize::from(u16::from_be_bytes([b3, b4]));
+        if !(17..=MAX_TLS_CIPHERTEXT_RECORD_LEN).contains(&frag_len) {
+            return Err(CryptoError::InvalidRecord);
+        }
         let rec_total = 5usize
             .checked_add(frag_len)
             .ok_or(CryptoError::InvalidRecord)?;
-        let Some(rec) = self.read_buf.get(..rec_total) else {
+        let Some(rec) = avail.get(..rec_total) else {
             return Ok(None);
         };
         let (inner_ct, payload) = self.client_app.open_record(rec)?;
-        self.read_buf.drain(..rec_total);
+        self.read_offset = self.read_offset.saturating_add(rec_total);
+        if self.read_offset >= self.read_buf.len() {
+            self.read_buf.clear();
+            self.read_offset = 0;
+        }
         Ok(Some((inner_ct, payload)))
     }
 
@@ -395,6 +467,13 @@ impl RealityTlsSession {
     /// (used when XTLS-Vision switches uplink to `DirectCopy`).
     #[must_use]
     pub fn into_remaining_wire_bytes(mut self) -> Vec<u8> {
+        if self.read_offset > 0 {
+            if self.read_offset >= self.read_buf.len() {
+                self.read_buf.clear();
+            } else {
+                self.read_buf.drain(..self.read_offset);
+            }
+        }
         core::mem::take(&mut self.read_buf)
     }
 
@@ -509,49 +588,71 @@ pub fn prepare_server_flight(
         wire_bytes.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
     }
 
-    // 3. EncryptedExtensions
-    let ee_msg = build_encrypted_extensions_msg(client_hello.sni.is_some());
+    // 3. EncryptedExtensions (with SNI ack + negotiated ALPN if offered)
+    let ee_msg =
+        build_encrypted_extensions_msg(client_hello.sni.is_some(), client_hello.offered_alpn);
     transcript.update(&ee_msg);
-    let ee_rec = server_hs_cipher.seal_record(
-        0x16,
-        &ee_msg,
-        nonzero_target(dest_profile.encrypted_record_lens.first().copied()),
-    )?;
-    wire_bytes.extend_from_slice(&ee_rec);
 
     // 4. Certificate (forged with HMAC-SHA512(AuthKey, ed25519_pub))
     let forged_cert_der = cert_template.forge_cert_der(&auth.auth_key)?;
     let cert_msg = build_certificate_msg(&forged_cert_der)?;
     transcript.update(&cert_msg);
-    let cert_rec = server_hs_cipher.seal_record(
-        0x16,
-        &cert_msg,
-        nonzero_target(dest_profile.encrypted_record_lens.get(1).copied()),
-    )?;
-    wire_bytes.extend_from_slice(&cert_rec);
 
     // 5. CertificateVerify (Ed25519 signature 0x0807)
     let cert_verify_sig = cert_template.sign_certificate_verify(&transcript.current_hash());
     let cv_msg = build_certificate_verify_msg(&cert_verify_sig);
     transcript.update(&cv_msg);
-    let cv_rec = server_hs_cipher.seal_record(
-        0x16,
-        &cv_msg,
-        nonzero_target(dest_profile.encrypted_record_lens.get(2).copied()),
-    )?;
-    wire_bytes.extend_from_slice(&cv_rec);
 
     // 6. Server Finished
     let server_finished_vd =
         s_hs_secret.compute_finished_verify_data(&transcript.current_hash())?;
     let fin_msg = build_finished_msg(&server_finished_vd)?;
     transcript.update(&fin_msg);
-    let fin_rec = server_hs_cipher.seal_record(
-        0x16,
-        &fin_msg,
-        nonzero_target(dest_profile.encrypted_record_lens.get(3).copied()),
-    )?;
-    wire_bytes.extend_from_slice(&fin_rec);
+
+    let r0 = nonzero_target(dest_profile.encrypted_record_lens.first().copied());
+    let r1 = nonzero_target(dest_profile.encrypted_record_lens.get(1).copied());
+    let r2 = nonzero_target(dest_profile.encrypted_record_lens.get(2).copied());
+    let r3 = nonzero_target(dest_profile.encrypted_record_lens.get(3).copied());
+
+    // If `dest` coalesced its encrypted handshake messages into a single 0x17 record,
+    // coalesce EE || Cert || CV || Finished into one 0x17 record matching `dest`'s length.
+    if r0.is_some() && r1.is_none() {
+        let total_hs_len = ee_msg
+            .len()
+            .saturating_add(cert_msg.len())
+            .saturating_add(cv_msg.len())
+            .saturating_add(fin_msg.len());
+        if total_hs_len <= MAX_TLS_RECORD_FRAGMENT {
+            let mut coalesced = Vec::with_capacity(total_hs_len);
+            coalesced.extend_from_slice(&ee_msg);
+            coalesced.extend_from_slice(&cert_msg);
+            coalesced.extend_from_slice(&cv_msg);
+            coalesced.extend_from_slice(&fin_msg);
+            let coalesced_rec = server_hs_cipher.seal_record(0x16, &coalesced, r0)?;
+            wire_bytes.extend_from_slice(&coalesced_rec);
+        } else {
+            let ee_rec = server_hs_cipher.seal_record(0x16, &ee_msg, None)?;
+            let cert_rec = server_hs_cipher.seal_record(0x16, &cert_msg, None)?;
+            let cv_rec = server_hs_cipher.seal_record(0x16, &cv_msg, None)?;
+            let fin_rec = server_hs_cipher.seal_record(0x16, &fin_msg, None)?;
+            wire_bytes.extend_from_slice(&ee_rec);
+            wire_bytes.extend_from_slice(&cert_rec);
+            wire_bytes.extend_from_slice(&cv_rec);
+            wire_bytes.extend_from_slice(&fin_rec);
+        }
+    } else {
+        let ee_rec = server_hs_cipher.seal_record(0x16, &ee_msg, r0)?;
+        wire_bytes.extend_from_slice(&ee_rec);
+
+        let cert_rec = server_hs_cipher.seal_record(0x16, &cert_msg, r1)?;
+        wire_bytes.extend_from_slice(&cert_rec);
+
+        let cv_rec = server_hs_cipher.seal_record(0x16, &cv_msg, r2)?;
+        wire_bytes.extend_from_slice(&cv_rec);
+
+        let fin_rec = server_hs_cipher.seal_record(0x16, &fin_msg, r3)?;
+        wire_bytes.extend_from_slice(&fin_rec);
+    }
 
     // 7. Derive Application traffic secrets & expected Client Finished
     let sf_hash = transcript.current_hash();
@@ -589,6 +690,10 @@ impl RealityPendingHandshake {
     /// Feeds bytes from the client socket until optional `ChangeCipherSpec` and
     /// encrypted client `Finished` have been verified.
     pub fn feed_client_bytes(&mut self, data: &[u8]) -> ClientFlightStatus {
+        let new_len = self.incoming_buf.len().saturating_add(data.len());
+        if new_len > MAX_TLS_CIPHERTEXT_RECORD_LEN.saturating_mul(2) {
+            return ClientFlightStatus::Failed;
+        }
         self.incoming_buf.extend_from_slice(data);
         let mut offset = 0usize;
 
@@ -605,6 +710,9 @@ impl RealityPendingHandshake {
                 return ClientFlightStatus::Failed;
             }
             let frag_len = usize::from(u16::from_be_bytes([b3, b4]));
+            if frag_len == 0 || frag_len > MAX_TLS_CIPHERTEXT_RECORD_LEN {
+                return ClientFlightStatus::Failed;
+            }
             let Some(rec_total) = 5usize.checked_add(frag_len) else {
                 return ClientFlightStatus::Failed;
             };
@@ -667,6 +775,7 @@ impl RealityPendingHandshake {
                 client_app,
                 cipher_suite: self.cipher_suite,
                 read_buf: trailing,
+                read_offset: 0,
             };
             let initial_app_data = Vec::new();
             let _ = &mut session;
@@ -691,13 +800,32 @@ const fn nonzero_target(val: Option<usize>) -> Option<usize> {
     }
 }
 
-fn build_encrypted_extensions_msg(ack_sni: bool) -> Vec<u8> {
+fn build_encrypted_extensions_msg(ack_sni: bool, offered_alpn: Option<OfferedAlpn>) -> Vec<u8> {
+    let mut exts = Vec::with_capacity(24);
     if ack_sni {
-        // 0x08 (EncryptedExtensions) || u24_len(6) || u16 ext_len(4) || 0x0000 (SNI) || 0x0000
-        vec![0x08, 0x00, 0x00, 0x06, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00]
-    } else {
-        vec![0x08, 0x00, 0x00, 0x02, 0x00, 0x00]
+        // Empty server_name extension acknowledgement: 0x0000 || u16(0)
+        exts.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
     }
+    if let Some(alpn) = offered_alpn {
+        let proto = alpn.as_bytes();
+        let proto_len_u8 = u8::try_from(proto.len()).unwrap_or(0);
+        let list_len = 1u16.saturating_add(u16::from(proto_len_u8));
+        let ext_len = 2u16.saturating_add(list_len);
+        exts.extend_from_slice(&0x0010u16.to_be_bytes());
+        exts.extend_from_slice(&ext_len.to_be_bytes());
+        exts.extend_from_slice(&list_len.to_be_bytes());
+        exts.push(proto_len_u8);
+        exts.extend_from_slice(proto);
+    }
+
+    let exts_len_u16 = u16::try_from(exts.len()).unwrap_or(0);
+    let body_len_u32 = 2u32.saturating_add(u32::from(exts_len_u16));
+    let mut out = Vec::with_capacity(6usize.saturating_add(exts.len()));
+    out.push(0x08);
+    push_u24(&mut out, body_len_u32);
+    out.extend_from_slice(&exts_len_u16.to_be_bytes());
+    out.extend_from_slice(&exts);
+    out
 }
 
 fn build_certificate_msg(cert_der: &[u8]) -> Result<Vec<u8>, CryptoError> {

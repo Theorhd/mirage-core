@@ -472,11 +472,18 @@ async fn vless_vision_direct_copy_udp_dns_and_ssrf_blocking() {
             let mut app = vec![0x17, 0x03, 0x03, 0x00, 0x0B];
             app.extend_from_slice(b"VISION_INIT");
             let _ = s.write_all(&app).await;
-            // After direct copy starts, echo raw bytes verbatim!
+            // After direct copy starts, echo raw bytes verbatim across arbitrary TCP splits!
             let mut raw = [0u8; 64];
-            if let Ok(m) = s.read(&mut raw).await {
-                if let Some(r) = raw.get(..m) {
-                    let _ = s.write_all(r).await;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(500), s.read(&mut raw)).await {
+                    Ok(Ok(0) | Err(_)) | Err(_) => break,
+                    Ok(Ok(m)) => {
+                        if let Some(r) = raw.get(..m) {
+                            if s.write_all(r).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             let _ = s.shutdown().await;
@@ -555,15 +562,24 @@ async fn vless_vision_direct_copy_udp_dns_and_ssrf_blocking() {
         let _ = stream.write_all(&sealed_direct).await;
         let _ = stream.write_all(b"DIRECT_RAW_ECHO").await;
 
-        let mut echoed = vec![0u8; 64];
-        if let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut echoed)).await
+        let mut got = Vec::new();
+        let mut echoed = [0u8; 64];
+        while !got
+            .windows(b"DIRECT_RAW_ECHO".len())
+            .any(|w| w == b"DIRECT_RAW_ECHO")
         {
-            let got = echoed.get(..n).unwrap_or(&[]);
-            assert!(got
-                .windows(b"DIRECT_RAW_ECHO".len())
-                .any(|w| w == b"DIRECT_RAW_ECHO"));
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut echoed)).await {
+                Ok(Ok(0) | Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    if let Some(chunk) = echoed.get(..n) {
+                        got.extend_from_slice(chunk);
+                    }
+                }
+            }
         }
+        assert!(got
+            .windows(b"DIRECT_RAW_ECHO".len())
+            .any(|w| w == b"DIRECT_RAW_ECHO"));
     }
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(metrics_a.vless_tcp_sessions(), 1);

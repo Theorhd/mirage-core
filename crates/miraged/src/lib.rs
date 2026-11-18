@@ -8,4 +8,6 @@ pub mod error;
 pub mod hardening;
 pub mod keygen;
 pub mod metrics;
+pub mod mux;
+pub mod outbound;
 pub mod proxy;
