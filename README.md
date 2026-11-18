@@ -58,9 +58,12 @@ The repository is structured as a **Cargo Workspace** that strictly decouples pu
 
 ```text
 mirage-core/
-├── Cargo.toml                  # Cargo Workspace manifest
-├── Dockerfile                  # Multi-stage static musl build -> FROM scratch
-├── docker-compose.yml          # Hardened VPS deployment (read-only, cap_drop ALL, UID 65534)
+├── .github/workflows/ci.yml    # Workspace checks, tests, cargo-deny & cargo-audit CI
+├── Cargo.toml                  # Cargo Workspace manifest (deny unsafe, clippy pedantic/panic-free)
+├── config.example.toml         # Documented production TOML configuration template
+├── Dockerfile                  # Multi-stage static musl build -> FROM scratch (UID 65534)
+├── docker-compose.yml          # Hardened VPS deployment (read_only, cap_drop ALL, seccomp)
+├── seccomp-miraged.json        # Restrictive Linux seccomp syscall allowlist
 ├── crates/
 │   ├── mirage-core/            # Pure Sans-I/O protocol library (no sockets, no async I/O)
 │   │   ├── Cargo.toml
@@ -70,11 +73,20 @@ mirage-core/
 │   │       ├── crypto.rs       # X25519 ECDH, HKDF-SHA256, AEAD (AES-GCM / ChaCha20-Poly1305)
 │   │       ├── reality.rs      # Reality handshake state machine (Auth vs Fallback)
 │   │       ├── vless.rs        # Binary VLESS codec (Version, UUID, Addons, TCP/UDP commands)
-│   │       └── vision.rs       # XTLS-Vision (TLS-in-TLS padding & Application Data detection)
+│   │       ├── vision.rs       # XTLS-Vision (TLS-in-TLS padding & Application Data detection)
+│   │       └── egress.rs       # Fail-closed anti-SSRF egress IP/port policy
 │   └── miraged/                # Tokio asynchronous server binary
 │       ├── Cargo.toml
 │       └── src/
-│           └── main.rs         # CLI, TOML configuration, socket accept loop, tracing
+│           ├── lib.rs          # Shared daemon library exports
+│           ├── main.rs         # CLI (--check, keygen), runtime hardening & SIGHUP reload loop
+│           ├── config.rs       # Zeroizing TOML parser & validation (Hex + Base64url keys)
+│           ├── keygen.rs       # X25519 keypair, ShortID & UUIDv4 CLI generator (getrandom)
+│           ├── proxy.rs        # Accept loop, BytesMut peeking, SharedRuntime, Reality/Vision relay
+│           ├── dns.rs          # Private RFC 1035 DNS-over-UDP/TCP resolver
+│           ├── hardening.rs    # Core-dump disable, rlimit & privilege drop helpers
+│           ├── metrics.rs      # Lock-free, PII-free atomic counters
+│           └── error.rs        # Non-leaky daemon error types
 ├── SECURITY.md                 # Vulnerability disclosure policy
 └── README.md
 ```
@@ -84,14 +96,14 @@ mirage-core/
 | Crate | Responsibility | Characteristics |
 | --- | --- | --- |
 | **`mirage-core`** | Protocol parsing, cryptography, and state machines | Pure **Sans-I/O**; operates solely on byte slices/buffers (`bytes`). Deterministically unit-testable without network sockets or async timers. |
-| **`miraged`** | Server daemon, CLI, configuration, and async networking | Built on **Tokio**, `serde` + `toml`, and `tracing`. Manages TCP listeners, `BytesMut` peeking/buffering, fallback relays, and upstream connections. |
+| **`miraged`** | Server daemon, CLI, configuration, and async networking | Built on **Tokio**, `serde` + `toml`, and `tracing`. Manages TCP listeners, `BytesMut` peeking/buffering, fallback relays, `SIGHUP` hot reload, and upstream connections. |
 
 ### Technology Stack & Toolchain
 
-* **Rust**: Edition `2021` (or `2024`), MSRV `1.84+`
+* **Rust**: Edition `2021`, MSRV `1.85+` (workspace toolchain pinned in `rust-toolchain.toml`)
 * **Async & Buffering**: `tokio`, `bytes`
-* **TLS Parsing**: `tls-parser` or custom zero-allocation binary parser
-* **Cryptography**: `x25519-dalek`, `aws-lc-rs` / `ring`
+* **TLS Parsing**: Custom zero-copy Sans-I/O binary parser (zero heap allocations on probe path)
+* **Cryptography**: Pure-Rust stack (`x25519-dalek`, `ed25519-dalek`, `ml-kem`, `aes-gcm`, `chacha20poly1305`, `hkdf`, `hmac`, `sha2`, `subtle`, `getrandom`, `zeroize`)
 * **Configuration & Telemetry**: `serde`, `toml`, `tracing`
 * **Release Targets**: Static musl binaries for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`
 
@@ -116,24 +128,24 @@ Found a vulnerability? Please follow [SECURITY.md](SECURITY.md) — never open a
 
 ## Roadmap
 
-* [ ] **Milestone 1 — SNI Proxy & TCP Fallback**
+* [x] **Milestone 1 — SNI Proxy & TCP Fallback**
   * Async TCP listener in `miraged` with `BytesMut` initial-packet buffering and accept-side backpressure.
   * Non-destructive TLS `ClientHello` parsing (`SNI`, `Session ID`, `key_share` incl. hybrid `X25519MLKEM768`) with multi-segment / multi-record reassembly in `mirage-core::tls_parser`.
   * Transparent bidirectional TCP fallback (`tokio::io::copy_bidirectional`) to `dest`, applying the "never close, always delegate" rule.
   * Panic-free lint set, fuzz harness, and differential probing harness (`miraged` vs `dest`).
-* [ ] **Milestone 2 — Reality Cryptographic Handshake**
+* [x] **Milestone 2 — Reality Cryptographic Handshake**
   * X25519 ECDH key agreement, HKDF-SHA256 key derivation, and AEAD verification (`crypto.rs`).
   * Session ID decryption, constant-time `ShortID` matching, timestamp window, and fail-closed anti-replay cache (`reality.rs`).
   * Completion of the authenticated Reality TLS 1.3 handshake flow, mimicking the `dest` handshake profile and preferring `X25519MLKEM768`.
-* [ ] **Milestone 3 — VLESS Protocol & XTLS-Vision**
+* [x] **Milestone 3 — VLESS Protocol & XTLS-Vision**
   * Binary VLESS request/response framing (version, UUID authentication, addons, TCP/UDP commands) in `vless.rs`.
   * XTLS-Vision TLS-in-TLS padding and inner Application Data detection (`vision.rs`).
   * Full upstream TCP/UDP proxying with anti-SSRF egress policy on resolved IPs and private DNS resolution.
-* [ ] **Milestone 4 — Packaging & Hardening**
-  * Zeroizing TOML configuration loading, key rotation with hot reload, and CLI keypair / ShortID / UUID generation utilities.
-  * Multi-stage `Dockerfile` targeting `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` onto `FROM scratch`.
-  * Hardened `docker-compose.yml` (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `UID 65534`, seccomp, `logging: none`, no core dumps, no swap).
-  * Supply-chain pipeline: `cargo-audit`, `cargo-deny`, `cargo-vet`, reproducible builds, SBOM, signed images.
+* [x] **Milestone 4 — Packaging & Hardening**
+  * [x] Zeroizing TOML configuration loading, `SIGHUP` key rotation with hot reload, `miraged --check`, and `miraged keygen` CLI utilities.
+  * [x] Multi-stage `Dockerfile` targeting `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` onto `FROM scratch`.
+  * [x] Hardened `docker-compose.yml` (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `UID 65534`, seccomp, `logging: none`, no core dumps, no swap).
+  * [ ] Supply-chain pipeline: `cargo-audit` and `cargo-deny` configured in `.github/workflows/ci.yml`; `cargo-vet`, reproducible builds, CycloneDX SBOM, and `cosign` image signing remain to be added.
 
 ---
 
