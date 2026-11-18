@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 description = "Hardened async Tokio daemon for mirage-core"
 
 [dependencies]
-mirage-core = { path = "../mirage-core" }
+mirage-core = { path = "../mirage-core", version = "0.1.0" }
 bytes.workspace = true
 getrandom.workspace = true
 serde.workspace = true
