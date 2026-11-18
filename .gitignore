@@ -13,6 +13,9 @@ config.toml
 *.pem
 secrets/
 
+# Local-only documentation
+/docs/
+
 # OS & editor files
 .DS_Store
 .idea/
