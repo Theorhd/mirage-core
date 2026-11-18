@@ -8,6 +8,16 @@ repository.workspace = true
 description = "Sans-I/O protocol core for Xray-Reality, VLESS, and XTLS-Vision"
 
 [dependencies]
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+ml-kem.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

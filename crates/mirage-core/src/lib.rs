@@ -5,4 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+pub mod crypto;
+pub mod reality;
 pub mod tls_parser;
