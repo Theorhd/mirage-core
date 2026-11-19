@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "miraged"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "ed25519-dalek",
