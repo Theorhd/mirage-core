@@ -109,6 +109,7 @@
         "sigaltstack",
         "socket",
         "socketpair",
+        "splice",
         "stat",
         "statfs",
         "statx",

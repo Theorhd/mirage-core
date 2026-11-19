@@ -18,11 +18,31 @@ const DEFAULT_INITIAL_READ_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_MAX_CONNECTIONS: usize = 4_096;
 const DEFAULT_MAX_TIME_DIFF_SECS: u64 = 60;
 const DEFAULT_REPLAY_CACHE_CAPACITY: usize = 65_536;
+const DEFAULT_TCP_IDLE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_UDP_IDLE_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_HALF_CLOSE_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
+const DEFAULT_DEST_PROFILE_CACHE_TTL_SECS: u64 = 120;
+const DEFAULT_HAPPY_EYEBALLS_DELAY_MS: u64 = 75;
+const DEFAULT_LISTEN_BACKLOG: u32 = 1_024;
 const MIN_CLIENT_HELLO_BYTES: usize = 64;
 const MAX_CLIENT_HELLO_BYTES_CAP: usize = 64 * 1024;
 const MIN_READ_TIMEOUT_MS: u64 = 100;
 const MAX_READ_TIMEOUT_MS: u64 = 60_000;
 const MAX_TIME_DIFF_SECS_CAP: u64 = 3_600;
+
+/// Outbound IP address-family preference for DNS resolution and Happy Eyeballs dialing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpStrategy {
+    /// Interleave IPv4 first, then IPv6 (avoids IPv6 latency penalties on IPv4-first VPSes).
+    #[default]
+    PreferV4,
+    /// Interleave IPv6 first, then IPv4 (RFC 8305 IPv6-first preference).
+    PreferV6,
+    /// Query and dial IPv4 (`A`) records only.
+    V4Only,
+}
 
 struct DeserializedPrivateKey(StaticPrivateKey);
 
@@ -140,6 +160,10 @@ struct RawVlessConfig {
     allow_private_egress: bool,
     #[serde(default)]
     allow_smtp_port_25: bool,
+    #[serde(default)]
+    block_quic: bool,
+    #[serde(default)]
+    ip_strategy: IpStrategy,
     #[serde(default = "default_dns_resolver")]
     dns_resolver: SocketAddr,
     #[serde(default)]
@@ -173,6 +197,20 @@ struct RawConfig {
     initial_read_timeout_ms: u64,
     #[serde(default = "default_max_connections")]
     max_connections: usize,
+    #[serde(default = "default_tcp_idle_timeout_secs")]
+    tcp_idle_timeout_secs: u64,
+    #[serde(default = "default_udp_idle_timeout_secs")]
+    udp_idle_timeout_secs: u64,
+    #[serde(default = "default_half_close_timeout_secs")]
+    half_close_timeout_secs: u64,
+    #[serde(default = "default_tcp_keepalive_secs")]
+    tcp_keepalive_secs: u64,
+    #[serde(default = "default_dest_profile_cache_ttl_secs")]
+    dest_profile_cache_ttl_secs: u64,
+    #[serde(default = "default_happy_eyeballs_delay_ms")]
+    happy_eyeballs_delay_ms: u64,
+    #[serde(default = "default_listen_backlog")]
+    listen_backlog: u32,
     #[serde(default)]
     unsafe_debug_logging: bool,
     #[serde(default)]
@@ -193,6 +231,34 @@ const fn default_max_connections() -> usize {
     DEFAULT_MAX_CONNECTIONS
 }
 
+const fn default_tcp_idle_timeout_secs() -> u64 {
+    DEFAULT_TCP_IDLE_TIMEOUT_SECS
+}
+
+const fn default_udp_idle_timeout_secs() -> u64 {
+    DEFAULT_UDP_IDLE_TIMEOUT_SECS
+}
+
+const fn default_half_close_timeout_secs() -> u64 {
+    DEFAULT_HALF_CLOSE_TIMEOUT_SECS
+}
+
+const fn default_tcp_keepalive_secs() -> u64 {
+    DEFAULT_TCP_KEEPALIVE_SECS
+}
+
+const fn default_dest_profile_cache_ttl_secs() -> u64 {
+    DEFAULT_DEST_PROFILE_CACHE_TTL_SECS
+}
+
+const fn default_happy_eyeballs_delay_ms() -> u64 {
+    DEFAULT_HAPPY_EYEBALLS_DELAY_MS
+}
+
+const fn default_listen_backlog() -> u32 {
+    DEFAULT_LISTEN_BACKLOG
+}
+
 const fn default_max_time_diff_secs() -> u64 {
     DEFAULT_MAX_TIME_DIFF_SECS
 }
@@ -211,6 +277,8 @@ pub struct VlessConfig {
     uuids: Vec<VlessUuid>,
     allow_private_egress: bool,
     allow_smtp_port_25: bool,
+    block_quic: bool,
+    ip_strategy: IpStrategy,
     dns_resolver: SocketAddr,
     allow_system_dns: bool,
 }
@@ -228,11 +296,27 @@ impl VlessConfig {
             uuids,
             allow_private_egress,
             allow_smtp_port_25,
+            block_quic: false,
+            ip_strategy: IpStrategy::default(),
             dns_resolver,
             allow_system_dns,
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Configures whether outbound UDP port 443 (QUIC/HTTP3) is blocked.
+    #[must_use]
+    pub const fn with_block_quic(mut self, block_quic: bool) -> Self {
+        self.block_quic = block_quic;
+        self
+    }
+
+    /// Configures the outbound IP address-family preference.
+    #[must_use]
+    pub const fn with_ip_strategy(mut self, ip_strategy: IpStrategy) -> Self {
+        self.ip_strategy = ip_strategy;
+        self
     }
 
     fn validate(&self) -> Result<(), DaemonError> {
@@ -260,6 +344,18 @@ impl VlessConfig {
         self.allow_smtp_port_25
     }
 
+    /// Returns whether outbound UDP port 443 (QUIC/HTTP3) is blocked (default `false`).
+    #[must_use]
+    pub const fn block_quic(&self) -> bool {
+        self.block_quic
+    }
+
+    /// Returns the configured outbound IP family strategy (default `PreferV6`).
+    #[must_use]
+    pub const fn ip_strategy(&self) -> IpStrategy {
+        self.ip_strategy
+    }
+
     /// Returns the configured private recursive DNS resolver address.
     #[must_use]
     pub const fn dns_resolver(&self) -> SocketAddr {
@@ -279,6 +375,8 @@ impl fmt::Debug for VlessConfig {
             .field("uuids_count", &self.uuids.len())
             .field("allow_private_egress", &self.allow_private_egress)
             .field("allow_smtp_port_25", &self.allow_smtp_port_25)
+            .field("block_quic", &self.block_quic)
+            .field("ip_strategy", &self.ip_strategy)
             .field("allow_system_dns", &self.allow_system_dns)
             .finish()
     }
@@ -392,6 +490,13 @@ pub struct Config {
     max_client_hello_bytes: usize,
     initial_read_timeout_ms: u64,
     max_connections: usize,
+    tcp_idle_timeout_secs: u64,
+    udp_idle_timeout_secs: u64,
+    half_close_timeout_secs: u64,
+    tcp_keepalive_secs: u64,
+    dest_profile_cache_ttl_secs: u64,
+    happy_eyeballs_delay_ms: u64,
+    listen_backlog: u32,
     unsafe_debug_logging: bool,
     reality: Option<RealityConfig>,
     vless: Option<VlessConfig>,
@@ -415,12 +520,40 @@ impl Config {
             max_client_hello_bytes,
             initial_read_timeout_ms,
             max_connections,
+            tcp_idle_timeout_secs: DEFAULT_TCP_IDLE_TIMEOUT_SECS,
+            udp_idle_timeout_secs: DEFAULT_UDP_IDLE_TIMEOUT_SECS,
+            half_close_timeout_secs: DEFAULT_HALF_CLOSE_TIMEOUT_SECS,
+            tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
+            dest_profile_cache_ttl_secs: DEFAULT_DEST_PROFILE_CACHE_TTL_SECS,
+            happy_eyeballs_delay_ms: DEFAULT_HAPPY_EYEBALLS_DELAY_MS,
+            listen_backlog: DEFAULT_LISTEN_BACKLOG,
             unsafe_debug_logging,
             reality: None,
             vless: None,
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Configures the `DestServerProfile` cache TTL in seconds (`0` disables caching).
+    pub fn with_dest_profile_cache_ttl_secs(mut self, ttl_secs: u64) -> Result<Self, DaemonError> {
+        self.dest_profile_cache_ttl_secs = ttl_secs;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Configures the TCP keepalive idle interval in seconds (`0` disables keepalive).
+    pub fn with_tcp_keepalive_secs(mut self, secs: u64) -> Result<Self, DaemonError> {
+        self.tcp_keepalive_secs = secs;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Configures the Happy Eyeballs head-start delay in milliseconds.
+    pub fn with_happy_eyeballs_delay_ms(mut self, delay_ms: u64) -> Result<Self, DaemonError> {
+        self.happy_eyeballs_delay_ms = delay_ms;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Attaches a validated `RealityConfig` to this configuration.
@@ -460,6 +593,15 @@ impl Config {
             raw.max_connections,
             raw.unsafe_debug_logging,
         )?;
+        cfg.tcp_idle_timeout_secs = raw.tcp_idle_timeout_secs;
+        cfg.udp_idle_timeout_secs = raw.udp_idle_timeout_secs;
+        cfg.half_close_timeout_secs = raw.half_close_timeout_secs;
+        cfg.tcp_keepalive_secs = raw.tcp_keepalive_secs;
+        cfg.dest_profile_cache_ttl_secs = raw.dest_profile_cache_ttl_secs;
+        cfg.happy_eyeballs_delay_ms = raw.happy_eyeballs_delay_ms;
+        cfg.listen_backlog = raw.listen_backlog;
+        cfg.validate()?;
+
         if let Some(rc) = raw.reality {
             let private_keys = rc.private_keys.into_iter().map(|k| k.0).collect();
             let short_ids = rc.short_ids.into_iter().map(|s| s.0).collect();
@@ -481,7 +623,9 @@ impl Config {
                 vc.allow_smtp_port_25,
                 vc.dns_resolver,
                 vc.allow_system_dns,
-            )?;
+            )?
+            .with_block_quic(vc.block_quic)
+            .with_ip_strategy(vc.ip_strategy);
             cfg = cfg.with_vless(validated_vc)?;
         }
         Ok(cfg)
@@ -505,6 +649,27 @@ impl Config {
             return Err(DaemonError::ConfigInvalid);
         }
         if self.max_connections == 0 {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if !(5..=86_400).contains(&self.tcp_idle_timeout_secs) {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if !(5..=3_600).contains(&self.udp_idle_timeout_secs) {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if !(1..=300).contains(&self.half_close_timeout_secs) {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if self.tcp_keepalive_secs > 600 {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if self.dest_profile_cache_ttl_secs > 3_600 {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if !(10..=2_000).contains(&self.happy_eyeballs_delay_ms) {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if !(128..=65_535).contains(&self.listen_backlog) {
             return Err(DaemonError::ConfigInvalid);
         }
         Ok(())
@@ -550,6 +715,51 @@ impl Config {
     #[must_use]
     pub const fn max_connections(&self) -> usize {
         self.max_connections
+    }
+
+    /// Returns the idle timeout enforced on active TCP relay streams.
+    #[must_use]
+    pub const fn tcp_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.tcp_idle_timeout_secs)
+    }
+
+    /// Returns the idle timeout enforced on UDP / XUDP relay sockets.
+    #[must_use]
+    pub const fn udp_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.udp_idle_timeout_secs)
+    }
+
+    /// Returns the shortened drain timeout applied once one side of a TCP relay closes.
+    #[must_use]
+    pub const fn half_close_timeout(&self) -> Duration {
+        Duration::from_secs(self.half_close_timeout_secs)
+    }
+
+    /// Returns the TCP keepalive idle interval (`Duration::ZERO` disables keepalive).
+    #[must_use]
+    pub const fn tcp_keepalive(&self) -> Duration {
+        Duration::from_secs(self.tcp_keepalive_secs)
+    }
+
+    /// Returns the `DestServerProfile` cache TTL (`Duration::ZERO` disables caching).
+    #[must_use]
+    pub const fn dest_profile_cache_ttl(&self) -> Duration {
+        Duration::from_secs(self.dest_profile_cache_ttl_secs)
+    }
+
+    /// Returns the Happy Eyeballs head-start delay between address-family attempts.
+    #[must_use]
+    pub const fn happy_eyeballs_delay(&self) -> Duration {
+        Duration::from_millis(self.happy_eyeballs_delay_ms)
+    }
+
+    /// Returns the TCP accept backlog passed to `listen(2)`.
+    #[must_use]
+    pub const fn listen_backlog(&self) -> i32 {
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            self.listen_backlog as i32
+        }
     }
 
     /// Returns whether opt-in unsafe debug logging is enabled.
@@ -676,5 +886,50 @@ mod tests {
             Config::from_toml_str(empty_sid).err(),
             Some(DaemonError::ConfigInvalid)
         );
+    }
+
+    #[test]
+    fn parses_performance_and_video_tuning_fields() {
+        let toml = r#"
+            listen_addr = "127.0.0.1:8443"
+            dest_addr = "127.0.0.1:9443"
+            server_names = ["example.com"]
+            tcp_idle_timeout_secs = 240
+            udp_idle_timeout_secs = 90
+            half_close_timeout_secs = 8
+            tcp_keepalive_secs = 25
+            dest_profile_cache_ttl_secs = 180
+            happy_eyeballs_delay_ms = 60
+            listen_backlog = 2048
+
+            [vless]
+            uuids = ["11111111-1111-4111-8111-111111111111"]
+            block_quic = true
+            ip_strategy = "v4_only"
+        "#;
+        let parsed = Config::from_toml_str(toml);
+        assert!(parsed.is_ok());
+        if let Ok(cfg) = parsed {
+            assert_eq!(cfg.tcp_idle_timeout(), Duration::from_secs(240));
+            assert_eq!(cfg.udp_idle_timeout(), Duration::from_secs(90));
+            assert_eq!(cfg.half_close_timeout(), Duration::from_secs(8));
+            assert_eq!(cfg.tcp_keepalive(), Duration::from_secs(25));
+            assert_eq!(cfg.dest_profile_cache_ttl(), Duration::from_secs(180));
+            assert_eq!(cfg.happy_eyeballs_delay(), Duration::from_millis(60));
+            assert_eq!(cfg.listen_backlog(), 2048);
+            assert!(cfg.vless().is_some_and(VlessConfig::block_quic));
+            assert_eq!(
+                cfg.vless().map(VlessConfig::ip_strategy),
+                Some(IpStrategy::V4Only)
+            );
+        }
+
+        let bad_backlog = r#"
+            listen_addr = "127.0.0.1:8443"
+            dest_addr = "127.0.0.1:9443"
+            server_names = ["example.com"]
+            listen_backlog = 16
+        "#;
+        assert!(Config::from_toml_str(bad_backlog).is_err());
     }
 }

@@ -25,6 +25,10 @@ pub struct Metrics {
     vless_auth_failed: AtomicU64,
     egress_blocked: AtomicU64,
     vision_direct_switches: AtomicU64,
+    dest_profile_cache_hits: AtomicU64,
+    xudp_dropped: AtomicU64,
+    quic_blocked: AtomicU64,
+    splice_direct_copies: AtomicU64,
 }
 
 impl Metrics {
@@ -115,6 +119,22 @@ impl Metrics {
 
     pub fn inc_vision_direct_switches(&self) {
         self.vision_direct_switches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_dest_profile_cache_hits(&self) {
+        self.dest_profile_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_xudp_dropped(&self) {
+        self.xudp_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_quic_blocked(&self) {
+        self.quic_blocked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_splice_direct_copies(&self) {
+        self.splice_direct_copies.fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]
@@ -215,5 +235,25 @@ impl Metrics {
     #[must_use]
     pub fn vision_direct_switches(&self) -> u64 {
         self.vision_direct_switches.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn dest_profile_cache_hits(&self) -> u64 {
+        self.dest_profile_cache_hits.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn xudp_dropped(&self) -> u64 {
+        self.xudp_dropped.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn quic_blocked(&self) -> u64 {
+        self.quic_blocked.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn splice_direct_copies(&self) -> u64 {
+        self.splice_direct_copies.load(Ordering::Relaxed)
     }
 }

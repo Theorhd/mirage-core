@@ -15,6 +15,7 @@ COPY crates/miraged/Cargo.toml crates/miraged/Cargo.toml
 COPY crates crates
 
 ARG TARGETARCH
+ARG RUST_TARGET_CPU=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,id=mirage-target-${TARGETARCH:-host},sharing=locked \
@@ -25,7 +26,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         aarch64) TARGET="aarch64-unknown-linux-musl" ;; \
         *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
     esac; \
-    RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C link-arg=-Wl,-z,relro,-z,now --remap-path-prefix=/build=/src" \
+    CPU_FLAG=""; \
+    if [ -n "${RUST_TARGET_CPU}" ]; then CPU_FLAG="-C target-cpu=${RUST_TARGET_CPU}"; fi; \
+    RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C link-arg=-Wl,-z,relro,-z,now --remap-path-prefix=/build=/src ${CPU_FLAG}" \
     cargo build --release --locked --bin miraged --target "$TARGET"; \
     cp "/build/target/${TARGET}/release/miraged" /miraged; \
     chmod 0555 /miraged

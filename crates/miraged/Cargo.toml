@@ -13,6 +13,7 @@ mirage-core = { path = "../mirage-core", version = "0.1.0" }
 bytes.workspace = true
 getrandom.workspace = true
 serde.workspace = true
+socket2.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true

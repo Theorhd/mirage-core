@@ -11,8 +11,8 @@ use miraged::error::DaemonError;
 use miraged::hardening;
 use miraged::keygen;
 use miraged::metrics::Metrics;
+use miraged::net_opt::bind_tcp_listener;
 use miraged::proxy::{self, SharedRuntime};
-use tokio::net::TcpListener;
 use tracing::Level;
 
 const DEFAULT_CONFIG_PATH: &str = "/run/secrets/config.toml";
@@ -142,8 +142,7 @@ fn spawn_sighup_reloader(config_path: PathBuf, runtime: Arc<SharedRuntime>) {
 }
 
 async fn run(config_path: PathBuf, config: Config) -> Result<(), DaemonError> {
-    let listener = TcpListener::bind(config.listen_addr())
-        .await
+    let listener = bind_tcp_listener(config.listen_addr(), config.listen_backlog())
         .map_err(|_| DaemonError::BindFailed)?;
 
     let runtime = SharedRuntime::new(config)?;

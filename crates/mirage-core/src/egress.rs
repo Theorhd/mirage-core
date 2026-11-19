@@ -25,6 +25,10 @@ pub struct EgressPolicy {
     pub allow_private_egress: bool,
     /// Allow outbound TCP port 25 (SMTP) (default `false`).
     pub allow_smtp_port_25: bool,
+    /// Block outbound UDP port 443 (QUIC/HTTP3) to force streaming clients onto
+    /// HTTPS/TCP where XTLS-Vision DirectCopy eliminates double encryption and
+    /// QUIC-over-TCP congestion meltdown (default `false`).
+    pub block_quic: bool,
     /// Additional explicitly blocked IPs (e.g., daemon listen & `dest` IPs).
     pub blocked_ips: Vec<IpAddr>,
 }
@@ -43,6 +47,9 @@ impl EgressPolicy {
             return Err(EgressError::DeniedPort);
         }
         if is_tcp && port == 25 && !self.allow_smtp_port_25 {
+            return Err(EgressError::DeniedPort);
+        }
+        if !is_tcp && port == 443 && self.block_quic {
             return Err(EgressError::DeniedPort);
         }
         if self.is_self_blocked(ip) {
@@ -292,6 +299,7 @@ mod tests {
         let policy = EgressPolicy {
             allow_private_egress: false,
             allow_smtp_port_25: false,
+            block_quic: false,
             blocked_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))],
         };
 
@@ -367,5 +375,22 @@ mod tests {
                 "expected {ip_str}:{port} to be allowed"
             );
         }
+    }
+
+    #[test]
+    fn block_quic_rejects_udp_443_only() {
+        let policy = EgressPolicy {
+            allow_private_egress: false,
+            allow_smtp_port_25: false,
+            block_quic: true,
+            blocked_ips: Vec::new(),
+        };
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(
+            policy.validate_target(ip, 443, false),
+            Err(EgressError::DeniedPort)
+        );
+        assert!(policy.validate_target(ip, 443, true).is_ok());
+        assert!(policy.validate_target(ip, 53, false).is_ok());
     }
 }

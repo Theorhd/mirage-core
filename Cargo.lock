@@ -420,6 +420,7 @@ dependencies = [
  "rustix",
  "serde",
  "sha2",
+ "socket2",
  "subtle",
  "tokio",
  "toml",

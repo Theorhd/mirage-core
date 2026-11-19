@@ -9,5 +9,6 @@ pub mod hardening;
 pub mod keygen;
 pub mod metrics;
 pub mod mux;
+pub mod net_opt;
 pub mod outbound;
 pub mod proxy;

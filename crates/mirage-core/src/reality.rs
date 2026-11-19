@@ -322,6 +322,16 @@ impl RealityTlsReader {
 
     /// Consumes and decrypts at most ONE complete outer TLS 1.3 record.
     pub fn next_record(&mut self) -> Result<Option<(u8, Vec<u8>)>, CryptoError> {
+        let mut payload = Vec::new();
+        match self.next_record_into(&mut payload)? {
+            Some(inner_ct) => Ok(Some((inner_ct, payload))),
+            None => Ok(None),
+        }
+    }
+
+    /// Consumes and decrypts at most ONE complete outer TLS 1.3 record into a
+    /// reusable buffer `out`, avoiding per-record heap allocations on hot relay paths.
+    pub fn next_record_into(&mut self, out: &mut Vec<u8>) -> Result<Option<u8>, CryptoError> {
         let Some(avail) = self.read_buf.get(self.read_offset..) else {
             self.read_buf.clear();
             self.read_offset = 0;
@@ -346,13 +356,13 @@ impl RealityTlsReader {
         let Some(rec) = avail.get(..rec_total) else {
             return Ok(None);
         };
-        let (inner_ct, payload) = self.client_app.open_record(rec)?;
+        let inner_ct = self.client_app.open_record_into(rec, out)?;
         self.read_offset = self.read_offset.saturating_add(rec_total);
         if self.read_offset >= self.read_buf.len() {
             self.read_buf.clear();
             self.read_offset = 0;
         }
-        Ok(Some((inner_ct, payload)))
+        Ok(Some(inner_ct))
     }
 
     /// Consumes the reader and returns any unparsed raw wire bytes (for Vision direct switch).

@@ -885,6 +885,21 @@ impl Tls13RecordCipher {
     /// Decrypts a complete TLS 1.3 encrypted record (`0x17 0x03 0x03 <len> <ct>`),
     /// returning `(inner_content_type, plaintext)`.
     pub fn open_record(&mut self, wire_record: &[u8]) -> Result<(u8, Vec<u8>), CryptoError> {
+        let mut buf = Vec::new();
+        let ct = self.open_record_into(wire_record, &mut buf)?;
+        Ok((ct, buf))
+    }
+
+    /// Decrypts a complete TLS 1.3 encrypted record (`0x17 0x03 0x03 <len> <ct>`)
+    /// into a reusable buffer `out`, avoiding per-record heap allocations.
+    ///
+    /// Returns the inner TLS 1.3 content type on success. Scrubs and clears `out`
+    /// on failure.
+    pub fn open_record_into(
+        &mut self,
+        wire_record: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<u8, CryptoError> {
         let hdr = wire_record.get(..5).ok_or(CryptoError::InvalidRecord)?;
         if hdr.first() != Some(&0x17) || hdr.get(1) != Some(&0x03) || hdr.get(2) != Some(&0x03) {
             return Err(CryptoError::InvalidRecord);
@@ -903,37 +918,38 @@ impl Tls13RecordCipher {
         }
 
         let ct_slice = wire_record.get(5..).ok_or(CryptoError::InvalidRecord)?;
-        let mut buf = ct_slice.to_vec();
+        out.clear();
+        out.extend_from_slice(ct_slice);
 
         let nonce = self.next_nonce()?;
         let decrypt_res = match &self.cipher {
             CipherKind::Aes128(c) => {
-                c.decrypt_in_place(&AeadNonce::<Aes128Gcm>::from(nonce), hdr, &mut buf)
+                c.decrypt_in_place(&AeadNonce::<Aes128Gcm>::from(nonce), hdr, out)
             }
             CipherKind::Aes256(c) => {
-                c.decrypt_in_place(&AeadNonce::<Aes256Gcm>::from(nonce), hdr, &mut buf)
+                c.decrypt_in_place(&AeadNonce::<Aes256Gcm>::from(nonce), hdr, out)
             }
             CipherKind::ChaCha20(c) => {
-                c.decrypt_in_place(&AeadNonce::<ChaCha20Poly1305>::from(nonce), hdr, &mut buf)
+                c.decrypt_in_place(&AeadNonce::<ChaCha20Poly1305>::from(nonce), hdr, out)
             }
         };
         if decrypt_res.is_err() {
-            buf.zeroize();
+            out.zeroize();
             return Err(CryptoError::AeadFailed);
         }
 
-        while buf.last() == Some(&0) {
-            buf.pop();
+        while out.last() == Some(&0) {
+            out.pop();
         }
-        let Some(content_type) = buf.pop() else {
-            buf.zeroize();
+        let Some(content_type) = out.pop() else {
+            out.zeroize();
             return Err(CryptoError::InvalidRecord);
         };
-        if buf.len() > MAX_TLS_RECORD_FRAGMENT {
-            buf.zeroize();
+        if out.len() > MAX_TLS_RECORD_FRAGMENT {
+            out.zeroize();
             return Err(CryptoError::InvalidRecord);
         }
-        Ok((content_type, buf))
+        Ok(content_type)
     }
 
     fn next_nonce(&mut self) -> Result<[u8; 12], CryptoError> {

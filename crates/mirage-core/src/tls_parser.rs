@@ -207,7 +207,7 @@ impl KeyShares {
 }
 
 /// Preferred ALPN protocol offered by the client in extension `0x0010`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OfferedAlpn {
     /// Client offered `"h2"`.
     H2,
@@ -243,6 +243,9 @@ pub struct ClientHelloInfo {
     pub key_shares: KeyShares,
     /// Whether `supported_versions` advertises TLS 1.3 (`0x0304`).
     pub offers_tls13: bool,
+    /// Bitmask of TLS 1.3 cipher suites offered by the client
+    /// (bit 0 = AES_128_GCM_SHA256, bit 1 = AES_256_GCM_SHA384, bit 2 = CHACHA20_POLY1305_SHA256).
+    pub offered_tls13_ciphers: u8,
     /// Total TLS wire bytes consumed by the record(s) forming this `ClientHello`.
     pub wire_bytes_len: usize,
     /// Reassembled TLS handshake message (`0x01 || u24_len || body`, without 5-byte record headers).
@@ -558,7 +561,18 @@ fn parse_client_hello_body(
     if cipher_suites_len < 2 || (cipher_suites_len % 2) != 0 {
         return Err(FallbackReason::Malformed);
     }
-    let _ = r.read_slice(cipher_suites_len)?;
+    let cipher_suites_raw = r.read_slice(cipher_suites_len)?;
+    let mut offered_tls13_ciphers: u8 = 0;
+    for pair in cipher_suites_raw.chunks_exact(2) {
+        if let (Some(&b0), Some(&b1)) = (pair.first(), pair.get(1)) {
+            match u16::from_be_bytes([b0, b1]) {
+                0x1301 => offered_tls13_ciphers |= 1 << 0,
+                0x1302 => offered_tls13_ciphers |= 1 << 1,
+                0x1303 => offered_tls13_ciphers |= 1 << 2,
+                _ => {}
+            }
+        }
+    }
 
     let compression_len = usize::from(r.read_u8()?);
     if compression_len < 1 {
@@ -631,6 +645,7 @@ fn parse_client_hello_body(
         offered_alpn,
         key_shares,
         offers_tls13,
+        offered_tls13_ciphers,
         wire_bytes_len,
         handshake_raw: handshake_raw.to_vec(),
     })
@@ -849,6 +864,44 @@ pub struct DestServerProfile {
     /// Recorded encrypted handshake wire record lengths:
     /// `[EncryptedExtensions, Certificate, CertificateVerify, Finished, NewSessionTicket]`.
     pub encrypted_record_lens: [usize; 5],
+}
+
+impl DestServerProfile {
+    /// Produces a per-connection clone of this cached `DestServerProfile` with a
+    /// fresh 32-byte `ServerHello.random` and updated `legacy_session_id_echo`
+    /// matching the authenticating client's `ClientHello.session_id`.
+    ///
+    /// Returns `None` if `server_hello_raw` is malformed or incompatible with
+    /// the client's session ID length.
+    #[must_use]
+    pub fn adapt_for_client(&self, session_id: &[u8], mut fresh_random: [u8; 32]) -> Option<Self> {
+        // Guard against colliding with the RFC 8446 HelloRetryRequest magic random.
+        if fresh_random == HELLO_RETRY_REQUEST_RANDOM {
+            fresh_random[0] ^= 0xFF;
+        }
+        // `server_hello_raw` layout:
+        //   [0..4]   handshake header (0x02 || u24 len)
+        //   [4..6]   legacy_version (0x03 0x03)
+        //   [6..38]  ServerHello.random (32 bytes)
+        //   [38]     legacy_session_id_echo length
+        //   [39..39+sid_len] legacy_session_id_echo
+        let sid_len = usize::from(*self.server_hello_raw.get(38)?);
+        if sid_len != session_id.len() {
+            return None;
+        }
+        let sid_end = 39usize.checked_add(sid_len)?;
+
+        let mut adapted = self.clone();
+        adapted
+            .server_hello_raw
+            .get_mut(6..38)?
+            .copy_from_slice(&fresh_random);
+        adapted
+            .server_hello_raw
+            .get_mut(39..sid_end)?
+            .copy_from_slice(session_id);
+        Some(adapted)
+    }
 }
 
 /// Result of inspecting `dest`'s server flight.
@@ -1344,5 +1397,36 @@ mod tests {
             inspect_client_hello(&wire, DEFAULT_MAX_CLIENT_HELLO_BYTES),
             InspectOutcome::Fallback(FallbackReason::Malformed)
         );
+    }
+
+    #[test]
+    fn dest_profile_adapt_for_client_patches_random_and_session_id() {
+        let mut sh_raw = vec![0x02, 0x00, 0x00, 0x48];
+        sh_raw.extend_from_slice(&[0x03, 0x03]);
+        sh_raw.extend([0x11u8; 32]);
+        sh_raw.push(32);
+        sh_raw.extend([0x22u8; 32]);
+        sh_raw.extend_from_slice(&[0x13, 0x01, 0x00, 0x00, 0x00]);
+
+        let profile = DestServerProfile {
+            server_hello_raw: sh_raw,
+            key_exchange_offset: 71,
+            key_exchange_len: 0,
+            cipher_suite: Tls13CipherSuiteId::Aes128GcmSha256,
+            selected_group: SelectedGroup::X25519,
+            send_ccs: true,
+            encrypted_record_lens: [80, 1100, 128, 96, 200],
+        };
+
+        let new_sid = [0x99u8; 32];
+        let adapted = profile.adapt_for_client(&new_sid, HELLO_RETRY_REQUEST_RANDOM);
+        assert!(adapted.is_some());
+        if let Some(a) = adapted {
+            assert_ne!(
+                a.server_hello_raw.get(6..38),
+                Some(HELLO_RETRY_REQUEST_RANDOM.as_slice())
+            );
+            assert_eq!(a.server_hello_raw.get(39..71), Some(new_sid.as_slice()));
+        }
     }
 }

@@ -21,13 +21,14 @@ use mirage_core::vless::{encode_vless_response_header, VlessAddress, VlessUuid};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{AbortHandle, JoinHandle};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::dns::DnsResolver;
 use crate::metrics::Metrics;
-use crate::outbound::{connect_happy_eyeballs, EgressContext};
+use crate::net_opt::{tune_udp_socket, UDP_SOCKET_BUFFER_BYTES};
+use crate::outbound::{connect_happy_eyeballs_with_options, EgressContext};
 
 /// Maximum buffered undecoded Mux stream bytes per connection (`256 KiB`).
 const MAX_MUX_STREAM_BUFFER: usize = 256 * 1024;
@@ -45,10 +46,17 @@ const MAX_TUNNEL_XUDP_SESSIONS: usize = 128;
 const MAX_GLOBAL_UDP_SESSIONS: usize = 1024;
 
 /// Maximum outbound Mux frames queued per client tunnel before backpressure.
-const MUX_OUTBOUND_CHANNEL_CAPACITY: usize = 256;
+const MUX_OUTBOUND_CHANNEL_CAPACITY: usize = 1024;
 
 /// Maximum queued uplink chunks per Mux TCP sub-session.
-const MUX_SUBSTREAM_CHANNEL_CAPACITY: usize = 64;
+const MUX_SUBSTREAM_CHANNEL_CAPACITY: usize = 128;
+
+/// Maximum time the Mux reader loop waits for a single stalled TCP sub-stream
+/// channel before terminating that sub-stream to avoid tunnel-wide Head-of-Line blocking.
+const MUX_SUBSTREAM_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum concurrent background DNS resolutions spawned for Mux UDP cache misses per tunnel.
+const MAX_MUX_ASYNC_UDP_DNS_TASKS: usize = 32;
 
 /// Read chunk size for TCP sub-streams and TLS record framing (`16 KiB` matches max TLS 1.3 fragment).
 const MUX_RELAY_CHUNK_SIZE: usize = 16 * 1024;
@@ -243,10 +251,12 @@ impl GlobalUdpTable {
 
 type TcpSubstreamEntry = (mpsc::Sender<Zeroizing<Vec<u8>>>, JoinHandle<()>);
 
+type SharedResolvedUdpTarget = Arc<Mutex<Option<(VlessAddress, u16, SocketAddr)>>>;
+
 struct UdpSessionHandle {
     key: UdpNatKey,
     default_target: Option<MuxTarget>,
-    resolved_cache: Option<(VlessAddress, u16, SocketAddr)>,
+    resolved_cache: SharedResolvedUdpTarget,
 }
 
 /// Runs a `Mux.Cool` + `XUDP` multiplexed tunnel over Reality TLS 1.3.
@@ -278,29 +288,92 @@ pub async fn relay_vless_mux(
 
     let writer_handle = tokio::spawn(async move {
         let mut frame_buf = Zeroizing::new(Vec::with_capacity(4096));
+        let mut batch_buf = Zeroizing::new(Vec::with_capacity(MAX_TLS_RECORD_FRAGMENT));
         let mut record_buf = Zeroizing::new(Vec::with_capacity(MAX_TLS_RECORD_FRAGMENT + 32));
         while let Some(frame) = mux_rx.recv().await {
             if encode_mux_frame_into(&frame, &mut frame_buf).is_err() {
                 break;
             }
-            let mut off = 0usize;
-            while off < frame_buf.len() {
-                let end = off
-                    .saturating_add(MAX_TLS_RECORD_FRAGMENT)
-                    .min(frame_buf.len());
-                let Some(chunk) = frame_buf.get(off..end) else {
-                    break;
-                };
-                if tls_writer
-                    .seal_app_data_into(chunk, &mut record_buf)
-                    .is_err()
+            batch_buf.clear();
+            if frame_buf.len() <= MAX_TLS_RECORD_FRAGMENT {
+                batch_buf.extend_from_slice(&frame_buf);
+
+                // Opportunistically coalesce queued frames into a single 16 KiB TLS 1.3 record.
+                while batch_buf.len() < MAX_TLS_RECORD_FRAGMENT {
+                    match mux_rx.try_recv() {
+                        Ok(next_frame) => {
+                            if encode_mux_frame_into(&next_frame, &mut frame_buf).is_err() {
+                                let _ = client_write.shutdown().await;
+                                return;
+                            }
+                            if batch_buf.len().saturating_add(frame_buf.len())
+                                <= MAX_TLS_RECORD_FRAGMENT
+                            {
+                                batch_buf.extend_from_slice(&frame_buf);
+                            } else {
+                                if !batch_buf.is_empty() {
+                                    if tls_writer
+                                        .seal_app_data_into(&batch_buf, &mut record_buf)
+                                        .is_err()
+                                        || client_write.write_all(&record_buf).await.is_err()
+                                    {
+                                        return;
+                                    }
+                                    batch_buf.clear();
+                                }
+                                if frame_buf.len() <= MAX_TLS_RECORD_FRAGMENT {
+                                    batch_buf.extend_from_slice(&frame_buf);
+                                } else {
+                                    let mut off = 0usize;
+                                    while off < frame_buf.len() {
+                                        let end = off
+                                            .saturating_add(MAX_TLS_RECORD_FRAGMENT)
+                                            .min(frame_buf.len());
+                                        let Some(chunk) = frame_buf.get(off..end) else {
+                                            break;
+                                        };
+                                        if tls_writer
+                                            .seal_app_data_into(chunk, &mut record_buf)
+                                            .is_err()
+                                            || client_write.write_all(&record_buf).await.is_err()
+                                        {
+                                            return;
+                                        }
+                                        off = end;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if !batch_buf.is_empty()
+                    && (tls_writer
+                        .seal_app_data_into(&batch_buf, &mut record_buf)
+                        .is_err()
+                        || client_write.write_all(&record_buf).await.is_err())
                 {
                     return;
                 }
-                if client_write.write_all(&record_buf).await.is_err() {
-                    return;
+            } else {
+                let mut off = 0usize;
+                while off < frame_buf.len() {
+                    let end = off
+                        .saturating_add(MAX_TLS_RECORD_FRAGMENT)
+                        .min(frame_buf.len());
+                    let Some(chunk) = frame_buf.get(off..end) else {
+                        break;
+                    };
+                    if tls_writer
+                        .seal_app_data_into(chunk, &mut record_buf)
+                        .is_err()
+                        || client_write.write_all(&record_buf).await.is_err()
+                    {
+                        return;
+                    }
+                    off = end;
                 }
-                off = end;
             }
         }
         let _ = client_write.shutdown().await;
@@ -309,6 +382,7 @@ pub async fn relay_vless_mux(
     let mut tcp_subs: HashMap<u16, TcpSubstreamEntry> = HashMap::new();
     let mut udp_subs: HashMap<u16, UdpSessionHandle> = HashMap::new();
     let mut active_xudp_entries: HashMap<UdpNatKey, Arc<UdpNatEntry>> = HashMap::new();
+    let udp_dns_sem = Arc::new(Semaphore::new(MAX_MUX_ASYNC_UDP_DNS_TASKS));
 
     let mut mux_buf = Zeroizing::new(Vec::with_capacity(8192));
     let mut mux_off = 0usize;
@@ -316,6 +390,7 @@ pub async fn relay_vless_mux(
     trailing_app_data.zeroize();
 
     let mut wire = [0u8; MUX_RELAY_CHUNK_SIZE];
+    let mut record_payload = Zeroizing::new(Vec::with_capacity(MAX_TLS_RECORD_FRAGMENT + 32));
 
     'outer: loop {
         loop {
@@ -338,6 +413,7 @@ pub async fn relay_vless_mux(
                         &mut tcp_subs,
                         &mut udp_subs,
                         &mut active_xudp_entries,
+                        &udp_dns_sem,
                         &metrics,
                     )
                     .await;
@@ -360,23 +436,23 @@ pub async fn relay_vless_mux(
 
         let mut drained_record = false;
         loop {
-            match tls_reader.next_record() {
-                Ok(Some((0x17, mut payload))) => {
+            match tls_reader.next_record_into(&mut record_payload) {
+                Ok(Some(0x17)) => {
                     let unread = mux_buf.len().saturating_sub(mux_off);
-                    if unread.saturating_add(payload.len()) > MAX_MUX_STREAM_BUFFER {
-                        payload.zeroize();
+                    if unread.saturating_add(record_payload.len()) > MAX_MUX_STREAM_BUFFER {
+                        record_payload.zeroize();
                         break 'outer;
                     }
-                    mux_buf.extend_from_slice(&payload);
-                    payload.zeroize();
+                    mux_buf.extend_from_slice(&record_payload);
+                    record_payload.zeroize();
                     drained_record = true;
                 }
-                Ok(Some((0x15, mut payload))) => {
-                    payload.zeroize();
+                Ok(Some(0x15)) => {
+                    record_payload.zeroize();
                     break 'outer;
                 }
-                Ok(Some((_, mut payload))) => {
-                    payload.zeroize();
+                Ok(Some(_)) => {
+                    record_payload.zeroize();
                     continue;
                 }
                 Ok(None) => break,
@@ -425,6 +501,7 @@ async fn handle_decoded_mux_frame(
     tcp_subs: &mut HashMap<u16, TcpSubstreamEntry>,
     udp_subs: &mut HashMap<u16, UdpSessionHandle>,
     active_xudp_entries: &mut HashMap<UdpNatKey, Arc<UdpNatEntry>>,
+    udp_dns_sem: &Arc<Semaphore>,
     metrics: &Arc<Metrics>,
 ) {
     match frame.status {
@@ -508,7 +585,7 @@ async fn handle_decoded_mux_frame(
                     let handle = UdpSessionHandle {
                         key,
                         default_target: Some(target.clone()),
-                        resolved_cache: None,
+                        resolved_cache: Arc::new(Mutex::new(None)),
                     };
                     if let Some(prev) = udp_subs.insert(frame.id, handle) {
                         if prev.key != key {
@@ -534,6 +611,7 @@ async fn handle_decoded_mux_frame(
                                 udp_table,
                                 mux_tx,
                                 active_xudp_entries,
+                                udp_dns_sem,
                                 metrics,
                             )
                             .await;
@@ -551,9 +629,32 @@ async fn handle_decoded_mux_frame(
         }
         MuxStatus::Keep => {
             if let Some((up_tx, _)) = tcp_subs.get(&frame.id) {
-                if !frame.payload.is_empty() && up_tx.send(frame.payload).await.is_err() {
-                    if let Some((_, h)) = tcp_subs.remove(&frame.id) {
-                        h.abort();
+                if !frame.payload.is_empty() {
+                    // Fast path: enqueue without yielding; on backpressure wait only up to
+                    // `MUX_SUBSTREAM_SEND_TIMEOUT` so a single stalled substream never causes
+                    // Head-of-Line blocking across the entire Mux tunnel.
+                    let stalled_or_closed = match up_tx.try_send(frame.payload) {
+                        Ok(()) => false,
+                        Err(mpsc::error::TrySendError::Closed(_)) => true,
+                        Err(mpsc::error::TrySendError::Full(payload)) => !matches!(
+                            tokio::time::timeout(MUX_SUBSTREAM_SEND_TIMEOUT, up_tx.send(payload))
+                                .await,
+                            Ok(Ok(()))
+                        ),
+                    };
+                    if stalled_or_closed {
+                        if let Some((_, h)) = tcp_subs.remove(&frame.id) {
+                            h.abort();
+                        }
+                        let _ = mux_tx.try_send(MuxFrame {
+                            id: frame.id,
+                            status: MuxStatus::End,
+                            opt_data: false,
+                            opt_error: true,
+                            target: None,
+                            global_id: None,
+                            payload: Zeroizing::new(Vec::new()),
+                        });
                     }
                 }
                 return;
@@ -571,6 +672,7 @@ async fn handle_decoded_mux_frame(
                         udp_table,
                         mux_tx,
                         active_xudp_entries,
+                        udp_dns_sem,
                         metrics,
                     )
                     .await;
@@ -589,7 +691,7 @@ async fn handle_decoded_mux_frame(
                     let mut sub = UdpSessionHandle {
                         key,
                         default_target: Some(target.clone()),
-                        resolved_cache: None,
+                        resolved_cache: Arc::new(Mutex::new(None)),
                     };
                     if !frame.payload.is_empty() {
                         dispatch_udp_payload(
@@ -602,6 +704,7 @@ async fn handle_decoded_mux_frame(
                             udp_table,
                             mux_tx,
                             active_xudp_entries,
+                            udp_dns_sem,
                             metrics,
                         )
                         .await;
@@ -624,7 +727,8 @@ async fn dispatch_udp_payload(
     udp_table: &Arc<GlobalUdpTable>,
     mux_tx: &mpsc::Sender<MuxFrame>,
     active_xudp_entries: &mut HashMap<UdpNatKey, Arc<UdpNatEntry>>,
-    metrics: &Metrics,
+    udp_dns_sem: &Arc<Semaphore>,
+    metrics: &Arc<Metrics>,
 ) {
     let Some(target) = override_target.or(sub.default_target.as_ref()) else {
         return;
@@ -632,30 +736,6 @@ async fn dispatch_udp_payload(
     if target.network != MuxNetwork::Udp {
         return;
     }
-
-    let dest_sock = match &sub.resolved_cache {
-        Some((cached_addr, cached_port, cached_sock))
-            if cached_addr == &target.address && *cached_port == target.port =>
-        {
-            *cached_sock
-        }
-        _ => {
-            let targets = egress_ctx
-                .resolve_and_validate(
-                    &target.address,
-                    target.port,
-                    false,
-                    dns_resolver.map(Arc::as_ref),
-                    metrics,
-                )
-                .await;
-            let Some(&sock_addr) = targets.first() else {
-                return;
-            };
-            sub.resolved_cache = Some((target.address.clone(), target.port, sock_addr));
-            sock_addr
-        }
-    };
 
     let entry = udp_table.get_or_insert(sub.key, session_id, mux_tx);
     if matches!(sub.key, UdpNatKey::Xudp { .. })
@@ -665,12 +745,96 @@ async fn dispatch_udp_payload(
             .entry(sub.key)
             .or_insert_with(|| Arc::clone(&entry));
     }
+
+    // 1. Substream-local resolved cache fast path (zero network I/O).
+    let cached_hit = {
+        let guard = sub.resolved_cache.lock().unwrap_or_else(|e| e.into_inner());
+        match &*guard {
+            Some((cached_addr, cached_port, cached_sock))
+                if cached_addr == &target.address && *cached_port == target.port =>
+            {
+                Some(*cached_sock)
+            }
+            _ => None,
+        }
+    };
+
+    let dest_sock = if let Some(sock_addr) = cached_hit {
+        Some(sock_addr)
+    } else if let Some(targets) = egress_ctx.try_resolve_cached_and_validate(
+        &target.address,
+        target.port,
+        false,
+        dns_resolver.map(Arc::as_ref),
+        metrics,
+    ) {
+        let sock_addr = targets.first().copied();
+        if let Some(sa) = sock_addr {
+            let mut guard = sub.resolved_cache.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some((target.address.clone(), target.port, sa));
+        }
+        sock_addr
+    } else {
+        // 2. DNS cache miss: offload resolution + send to a bounded background task
+        // so the Mux reader loop never stalls on network DNS I/O.
+        let Ok(permit) = Arc::clone(udp_dns_sem).try_acquire_owned() else {
+            metrics.inc_xudp_dropped();
+            return;
+        };
+        let target_owned = target.clone();
+        let payload_owned = Zeroizing::new(payload.to_vec());
+        let egress = *egress_ctx;
+        let resolver = dns_resolver.map(Arc::clone);
+        let key = sub.key;
+        let cache_slot = Arc::clone(&sub.resolved_cache);
+        let table = Arc::clone(udp_table);
+        let m = Arc::clone(metrics);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let targets = egress
+                .resolve_and_validate(
+                    &target_owned.address,
+                    target_owned.port,
+                    false,
+                    resolver.as_deref(),
+                    &m,
+                )
+                .await;
+            let Some(&sock_addr) = targets.first() else {
+                return;
+            };
+            {
+                let mut guard = cache_slot.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some((target_owned.address, target_owned.port, sock_addr));
+            }
+            let Some(sock) = ensure_udp_socket_and_spawn_reader(
+                key,
+                sock_addr.is_ipv6(),
+                entry,
+                table,
+                Arc::clone(&m),
+            )
+            .await
+            else {
+                return;
+            };
+            if sock.send_to(&payload_owned, sock_addr).await.is_ok() {
+                m.inc_xudp_packets();
+            }
+        });
+        return;
+    };
+
+    let Some(dest_sock) = dest_sock else {
+        return;
+    };
+
     let Some(sock) = ensure_udp_socket_and_spawn_reader(
         sub.key,
         dest_sock.is_ipv6(),
         entry,
         Arc::clone(udp_table),
-        metrics,
+        Arc::clone(metrics),
     )
     .await
     else {
@@ -687,7 +851,7 @@ async fn ensure_udp_socket_and_spawn_reader(
     is_ipv6: bool,
     entry: Arc<UdpNatEntry>,
     udp_table: Arc<GlobalUdpTable>,
-    _metrics: &Metrics,
+    metrics: Arc<Metrics>,
 ) -> Option<Arc<UdpSocket>> {
     let slot = if is_ipv6 {
         &entry.v6_sock
@@ -702,6 +866,7 @@ async fn ensure_udp_socket_and_spawn_reader(
 
     let bind_addr = if is_ipv6 { "[::]:0" } else { "0.0.0.0:0" };
     let sock = Arc::new(UdpSocket::bind(bind_addr).await.ok()?);
+    tune_udp_socket(&sock, UDP_SOCKET_BUFFER_BYTES);
     *guard = Some(Arc::clone(&sock));
     drop(guard);
 
@@ -741,7 +906,9 @@ async fn ensure_udp_socket_and_spawn_reader(
                             global_id: None,
                             payload: Zeroizing::new(slice.to_vec()),
                         };
-                        let _ = tx.try_send(frame);
+                        if tx.try_send(frame).is_err() {
+                            metrics.inc_xudp_dropped();
+                        }
                     }
                 }
                 Err(_) => {
@@ -819,7 +986,13 @@ async fn run_mux_tcp_substream(
         return;
     }
 
-    let Some(upstream) = connect_happy_eyeballs(&targets).await else {
+    let Some(upstream) = connect_happy_eyeballs_with_options(
+        &targets,
+        egress.happy_eyeballs_delay,
+        egress.tcp_keepalive,
+    )
+    .await
+    else {
         send_mux_end(&mux_tx, id, true).await;
         return;
     };

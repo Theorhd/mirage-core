@@ -617,6 +617,27 @@ async fn reality_pq_and_x25519_handshakes_anti_replay_and_rotation() {
     .await;
     assert!(res_x.is_some(), "X25519 Reality handshake must succeed");
 
+    // Second authenticated handshake with a fresh ephemeral key & session ID must hit the
+    // cached DestServerProfile and complete TLS 1.3 without re-probing `dest`.
+    let res_x_cached = perform_client_reality_handshake(
+        proxy_x_addr,
+        &pub_current,
+        &short_id,
+        "reality-test.example.com",
+        x_lens,
+        false,
+        [0x88u8; 32],
+    )
+    .await;
+    assert!(
+        res_x_cached.is_some(),
+        "Cached-profile X25519 Reality handshake must succeed"
+    );
+    assert!(
+        metrics_x.dest_profile_cache_hits() >= 1,
+        "expected DestServerProfile cache hit on 2nd authenticated handshake"
+    );
+
     // Replay the EXACT same ClientHello bytes -> must be rejected and fall back to dest!
     let now_u32 = u32::try_from(
         SystemTime::now()
