@@ -1,7 +1,7 @@
 services:
   miraged:
     # Pin to a released version tag or immutable `@sha256:<digest>` in production.
-    image: ghcr.io/theorhd/mirage-core:v0.2.0
+    image: ghcr.io/theorhd/mirage-core:v0.3.0
     user: "65534:65534"
     read_only: true
     cap_drop:

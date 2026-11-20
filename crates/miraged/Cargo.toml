@@ -9,7 +9,7 @@ publish = false
 description = "Hardened async Tokio daemon for mirage-core"
 
 [dependencies]
-mirage-core = { path = "../mirage-core", version = "0.2.0" }
+mirage-core = { path = "../mirage-core", version = "0.3.0" }
 bytes.workspace = true
 getrandom.workspace = true
 serde.workspace = true

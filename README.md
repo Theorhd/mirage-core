@@ -118,11 +118,11 @@ Multi-architecture static `FROM scratch` images (`linux/amd64` and `linux/arm64`
 
 ```bash
 # Pull the hardened FROM scratch image directly on any VPS (prefer pinned version tag or @sha256 digest)
-docker pull ghcr.io/theorhd/mirage-core:v0.2.0
+docker pull ghcr.io/theorhd/mirage-core:v0.3.0
 
 # Generate Reality keys + UUIDv4 without Rust/Cargo installed
 docker run --rm --user 65534:65534 --read-only --cap-drop=ALL \
-  --security-opt no-new-privileges:true ghcr.io/theorhd/mirage-core:v0.2.0 keygen
+  --security-opt no-new-privileges:true ghcr.io/theorhd/mirage-core:v0.3.0 keygen
 ```
 
 To deploy with the hardened `docker-compose.yml` profile (no repository clone needed):
