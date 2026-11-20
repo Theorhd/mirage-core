@@ -39,7 +39,7 @@ pub fn disable_core_dumps() -> Result<(), DaemonError> {
     {
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
             .map_err(|_| DaemonError::HardeningFailed)?;
-        rustix::process::set_no_new_privs(true).map_err(|_| DaemonError::HardeningFailed)?;
+        rustix::thread::set_no_new_privs(true).map_err(|_| DaemonError::HardeningFailed)?;
     }
     Ok(())
 }
