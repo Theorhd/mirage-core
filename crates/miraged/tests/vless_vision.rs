@@ -152,23 +152,46 @@ async fn spawn_mock_dns_server(mapped_ip: Ipv4Addr) -> Option<(SocketAddr, onesh
             if query.len() < 12 {
                 continue;
             }
-            // Build minimal A-record response with compression pointer 0xC00C.
-            let mut resp = query.to_vec();
+            // Locate end of Question section so EDNS0 OPT additional records do not
+            // corrupt the Answer section offset.
+            let mut q_idx = 12usize;
+            while q_idx < query.len() {
+                let len = usize::from(*query.get(q_idx).unwrap_or(&0));
+                q_idx = q_idx.saturating_add(1);
+                if len == 0 {
+                    break;
+                }
+                q_idx = q_idx.saturating_add(len);
+            }
+            let Some(q_end) = q_idx.checked_add(4).filter(|&end| end <= query.len()) else {
+                continue;
+            };
+            let qtype = u16::from_be_bytes([
+                *query.get(q_idx).unwrap_or(&0),
+                *query.get(q_idx.saturating_add(1)).unwrap_or(&0),
+            ]);
+            let mut resp = query.get(..q_end).unwrap_or(query).to_vec();
             if let Some(flags) = resp.get_mut(2..4) {
                 flags.copy_from_slice(&0x8180u16.to_be_bytes());
             }
-            if let Some(ancount) = resp.get_mut(6..8) {
-                ancount.copy_from_slice(&1u16.to_be_bytes());
+            if let Some(counts) = resp.get_mut(6..12) {
+                counts.fill(0);
             }
-            resp.extend_from_slice(&[0xC0, 0x0C]);
-            resp.extend_from_slice(&1u16.to_be_bytes());
-            resp.extend_from_slice(&1u16.to_be_bytes());
-            resp.extend_from_slice(&60u32.to_be_bytes());
-            resp.extend_from_slice(&4u16.to_be_bytes());
-            resp.extend_from_slice(&mapped_ip.octets());
+            if qtype == 1 {
+                if let Some(ancount) = resp.get_mut(6..8) {
+                    ancount.copy_from_slice(&1u16.to_be_bytes());
+                }
+                resp.extend_from_slice(&[0xC0, 0x0C]);
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&60u32.to_be_bytes());
+                resp.extend_from_slice(&4u16.to_be_bytes());
+                resp.extend_from_slice(&mapped_ip.octets());
+            }
             let _ = parse_dns_response(
                 &resp,
                 u16::from_be_bytes([*query.first().unwrap_or(&0), *query.get(1).unwrap_or(&0)]),
+                qtype,
             );
             let _ = sock.send_to(&resp, peer).await;
         }
@@ -513,7 +536,7 @@ async fn vless_vision_direct_copy_udp_dns_and_ssrf_blocking() {
         let inner_ch = vec![
             0x16, 0x03, 0x01, 0x00, 0x06, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00,
         ];
-        client_filter.inspect(&inner_ch);
+        client_filter.inspect_uplink(&inner_ch);
         let padded_ch = client_padder.wrap_outbound(&inner_ch, &client_filter, 7);
         req.extend_from_slice(&padded_ch);
 
@@ -522,14 +545,29 @@ async fn vless_vision_direct_copy_udp_dns_and_ssrf_blocking() {
         };
         let _ = stream.write_all(&sealed_req).await;
 
-        // Read VLESS response [0x00, 0x00]
+        // Read masked VLESS response ([0x00, 0x00] || initial Vision padding block)
         let Some(r0) = read_tls_record(&mut stream).await else {
             return;
         };
-        assert_eq!(s_app.open_record(&r0).ok(), Some((0x17, vec![0x00, 0x00])));
+        let Ok((ct0, dec0)) = s_app.open_record(&r0) else {
+            return;
+        };
+        assert_eq!(ct0, 0x17);
+        assert!(
+            dec0.starts_with(&[0x00, 0x00]) && dec0.len() > 2,
+            "expected masked VLESS header + initial Vision padding block"
+        );
 
         // Read Vision-padded ServerHello + Vision-padded AppData (CommandPaddingDirect!)
         let mut client_unpadder = VisionUnpadder::new(uuid.clone());
+        let Some(init_vision) = dec0.get(2..) else {
+            return;
+        };
+        let Ok(out0) = client_unpadder.feed(init_vision) else {
+            return;
+        };
+        assert!(out0.payload.is_empty());
+
         let mut seen_init = false;
         while client_unpadder.mode() != UnpadMode::DirectCopy {
             let Some(rec) = read_tls_record(&mut stream).await else {
@@ -538,8 +576,10 @@ async fn vless_vision_direct_copy_udp_dns_and_ssrf_blocking() {
             let Ok((_, dec)) = s_app.open_record(&rec) else {
                 break;
             };
-            let out = client_unpadder.feed(&dec);
-            client_filter.inspect(&out.payload);
+            let Ok(out) = client_unpadder.feed(&dec) else {
+                break;
+            };
+            client_filter.inspect_downlink(&out.payload);
             if out.payload.ends_with(b"VISION_INIT") {
                 seen_init = true;
             }

@@ -1,5 +1,7 @@
 //! CSPRNG credential generation utilities (`miraged keygen`).
 
+use std::io::{self, Write};
+
 use mirage_core::crypto::{encode_base64url, encode_hex, StaticPrivateKey};
 use zeroize::Zeroizing;
 
@@ -9,7 +11,7 @@ use crate::error::DaemonError;
 /// UUIDv4 using `getrandom`, printing ready-to-paste values to stdout.
 pub fn run_keygen() -> Result<(), DaemonError> {
     let mut priv_raw = Zeroizing::new([0u8; 32]);
-    getrandom::fill(priv_raw.as_mut_slice()).map_err(|_| DaemonError::HardeningFailed)?;
+    getrandom::fill(priv_raw.as_mut_slice()).map_err(|_| DaemonError::EntropyFailed)?;
     // Apply X25519 scalar clamping so raw bytes match `xray x25519` conventions.
     if let Some(b0) = priv_raw.first_mut() {
         *b0 &= 248;
@@ -27,26 +29,37 @@ pub fn run_keygen() -> Result<(), DaemonError> {
     let pub_b64 = encode_base64url(&pub_key);
     let pub_hex = encode_hex(&pub_key);
 
-    let mut short_id = [0u8; 8];
-    getrandom::fill(&mut short_id).map_err(|_| DaemonError::HardeningFailed)?;
-    let short_id_hex = encode_hex(&short_id);
+    let mut short_id = Zeroizing::new([0u8; 8]);
+    getrandom::fill(short_id.as_mut_slice()).map_err(|_| DaemonError::EntropyFailed)?;
+    let short_id_hex = Zeroizing::new(encode_hex(short_id.as_slice()));
 
-    let mut uuid_bytes = [0u8; 16];
-    getrandom::fill(&mut uuid_bytes).map_err(|_| DaemonError::HardeningFailed)?;
+    let mut uuid_bytes = Zeroizing::new([0u8; 16]);
+    getrandom::fill(uuid_bytes.as_mut_slice()).map_err(|_| DaemonError::EntropyFailed)?;
     if let Some(b6) = uuid_bytes.get_mut(6) {
         *b6 = (*b6 & 0x0F) | 0x40;
     }
     if let Some(b8) = uuid_bytes.get_mut(8) {
         *b8 = (*b8 & 0x3F) | 0x80;
     }
-    let uuid_str = format_uuid_v4(&uuid_bytes);
+    let uuid_str = Zeroizing::new(format_uuid_v4(&uuid_bytes));
 
-    println!("PrivateKey (base64url): {}", *priv_b64);
-    println!("PublicKey  (base64url): {pub_b64}");
-    println!("PrivateKey (hex):       {}", *priv_hex);
-    println!("PublicKey  (hex):       {pub_hex}");
-    println!("ShortId    (hex):       {short_id_hex}");
-    println!("UUIDv4:                 {uuid_str}");
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    let write_res = (|| -> io::Result<()> {
+        writeln!(handle, "PrivateKey (base64url): {}", *priv_b64)?;
+        writeln!(handle, "PublicKey  (base64url): {pub_b64}")?;
+        writeln!(handle, "PrivateKey (hex):       {}", *priv_hex)?;
+        writeln!(handle, "PublicKey  (hex):       {pub_hex}")?;
+        writeln!(handle, "ShortId    (hex):       {}", *short_id_hex)?;
+        writeln!(handle, "UUIDv4:                 {}", *uuid_str)?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        if err.kind() != io::ErrorKind::BrokenPipe {
+            return Err(DaemonError::HardeningFailed);
+        }
+    }
 
     Ok(())
 }

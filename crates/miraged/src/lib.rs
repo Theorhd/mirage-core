@@ -1,6 +1,6 @@
 //! Async server runtime for `mirage-core`.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 pub mod config;
 pub mod dns;

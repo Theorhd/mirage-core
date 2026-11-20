@@ -2,10 +2,12 @@
 
 use core::fmt;
 use core::time::Duration;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::Path;
 
 use mirage_core::crypto::{ShortId, StaticPrivateKey};
+use mirage_core::egress::{is_valid_domain, normalize_ip};
 use mirage_core::tls_parser::DEFAULT_MAX_CLIENT_HELLO_BYTES;
 use mirage_core::vless::VlessUuid;
 use serde::de::{self, Visitor};
@@ -24,12 +26,19 @@ const DEFAULT_HALF_CLOSE_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 const DEFAULT_DEST_PROFILE_CACHE_TTL_SECS: u64 = 120;
 const DEFAULT_HAPPY_EYEBALLS_DELAY_MS: u64 = 75;
-const DEFAULT_LISTEN_BACKLOG: u32 = 1_024;
+const DEFAULT_LISTEN_BACKLOG: u16 = 1_024;
 const MIN_CLIENT_HELLO_BYTES: usize = 64;
 const MAX_CLIENT_HELLO_BYTES_CAP: usize = 64 * 1024;
 const MIN_READ_TIMEOUT_MS: u64 = 100;
 const MAX_READ_TIMEOUT_MS: u64 = 60_000;
 const MAX_TIME_DIFF_SECS_CAP: u64 = 3_600;
+const MAX_CONNECTIONS_CAP: usize = 1_048_576;
+const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_SERVER_NAMES: usize = 64;
+const MAX_PRIVATE_KEYS: usize = 16;
+const MAX_SHORT_IDS: usize = 256;
+const MAX_VLESS_UUIDS: usize = 1024;
+const MAX_REPLAY_CACHE_CAPACITY: usize = 16_777_216;
 
 /// Outbound IP address-family preference for DNS resolution and Happy Eyeballs dialing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -210,7 +219,7 @@ struct RawConfig {
     #[serde(default = "default_happy_eyeballs_delay_ms")]
     happy_eyeballs_delay_ms: u64,
     #[serde(default = "default_listen_backlog")]
-    listen_backlog: u32,
+    listen_backlog: u16,
     #[serde(default)]
     unsafe_debug_logging: bool,
     #[serde(default)]
@@ -255,7 +264,7 @@ const fn default_happy_eyeballs_delay_ms() -> u64 {
     DEFAULT_HAPPY_EYEBALLS_DELAY_MS
 }
 
-const fn default_listen_backlog() -> u32 {
+const fn default_listen_backlog() -> u16 {
     DEFAULT_LISTEN_BACKLOG
 }
 
@@ -320,7 +329,10 @@ impl VlessConfig {
     }
 
     fn validate(&self) -> Result<(), DaemonError> {
-        if self.uuids.is_empty() {
+        if self.uuids.is_empty() || self.uuids.len() > MAX_VLESS_UUIDS {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if self.dns_resolver.port() == 0 {
             return Err(DaemonError::ConfigInvalid);
         }
         Ok(())
@@ -350,7 +362,7 @@ impl VlessConfig {
         self.block_quic
     }
 
-    /// Returns the configured outbound IP family strategy (default `PreferV6`).
+    /// Returns the configured outbound IP family strategy (default `PreferV4`).
     #[must_use]
     pub const fn ip_strategy(&self) -> IpStrategy {
         self.ip_strategy
@@ -416,13 +428,18 @@ impl RealityConfig {
     }
 
     fn validate(&self) -> Result<(), DaemonError> {
-        if self.private_keys.is_empty() || self.short_ids.is_empty() {
+        if self.private_keys.is_empty()
+            || self.private_keys.len() > MAX_PRIVATE_KEYS
+            || self.short_ids.is_empty()
+            || self.short_ids.len() > MAX_SHORT_IDS
+        {
             return Err(DaemonError::ConfigInvalid);
         }
         if self.max_time_diff_secs == 0 || self.max_time_diff_secs > MAX_TIME_DIFF_SECS_CAP {
             return Err(DaemonError::ConfigInvalid);
         }
-        if self.replay_cache_capacity == 0 {
+        if self.replay_cache_capacity == 0 || self.replay_cache_capacity > MAX_REPLAY_CACHE_CAPACITY
+        {
             return Err(DaemonError::ConfigInvalid);
         }
         if let (Some(min_v), Some(max_v)) = (self.min_client_ver, self.max_client_ver) {
@@ -496,7 +513,7 @@ pub struct Config {
     tcp_keepalive_secs: u64,
     dest_profile_cache_ttl_secs: u64,
     happy_eyeballs_delay_ms: u64,
-    listen_backlog: u32,
+    listen_backlog: u16,
     unsafe_debug_logging: bool,
     reality: Option<RealityConfig>,
     vless: Option<VlessConfig>,
@@ -563,20 +580,34 @@ impl Config {
         Ok(self)
     }
 
-    /// Attaches a validated `VlessConfig` to this configuration.
+    /// Attaches a validated `VlessConfig` to this configuration (requires `[reality]`).
     pub fn with_vless(mut self, vless: VlessConfig) -> Result<Self, DaemonError> {
         vless.validate()?;
         self.vless = Some(vless);
+        self.validate()?;
         Ok(self)
     }
 
-    /// Reads and validates configuration from a TOML file on disk.
+    /// Reads and validates configuration from a regular TOML file on disk (bounded at 1 MiB).
     ///
     /// Reads raw bytes into a `Zeroizing<String>` buffer so secret fields are
     /// scrubbed from heap memory immediately after deserialization.
     pub fn from_toml_file(path: &Path) -> Result<Self, DaemonError> {
+        let file = std::fs::File::open(path).map_err(|_| DaemonError::ConfigReadFailed)?;
+        let meta = file.metadata().map_err(|_| DaemonError::ConfigReadFailed)?;
+        if !meta.is_file() || meta.len() > MAX_CONFIG_FILE_BYTES {
+            return Err(DaemonError::ConfigReadFailed);
+        }
+        let mut raw_bytes = Zeroizing::new(Vec::new());
+        file.take(MAX_CONFIG_FILE_BYTES.saturating_add(1))
+            .read_to_end(&mut raw_bytes)
+            .map_err(|_| DaemonError::ConfigReadFailed)?;
+        if u64::try_from(raw_bytes.len()).unwrap_or(u64::MAX) > MAX_CONFIG_FILE_BYTES {
+            return Err(DaemonError::ConfigReadFailed);
+        }
         let raw_text = Zeroizing::new(
-            std::fs::read_to_string(path).map_err(|_| DaemonError::ConfigReadFailed)?,
+            String::from_utf8(core::mem::take(&mut *raw_bytes))
+                .map_err(|_| DaemonError::ConfigInvalid)?,
         );
         Self::from_toml_str(&raw_text)
     }
@@ -632,7 +663,18 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), DaemonError> {
-        if self.server_names.is_empty() {
+        if self.listen_addr.port() == 0 || self.dest_addr.port() == 0 {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if normalize_ip(self.listen_addr.ip()) == normalize_ip(self.dest_addr.ip())
+            && self.listen_addr.port() == self.dest_addr.port()
+        {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if self.vless.is_some() && self.reality.is_none() {
+            return Err(DaemonError::ConfigInvalid);
+        }
+        if self.server_names.is_empty() || self.server_names.len() > MAX_SERVER_NAMES {
             return Err(DaemonError::ConfigInvalid);
         }
         for name in &self.server_names {
@@ -648,7 +690,7 @@ impl Config {
         if !(MIN_READ_TIMEOUT_MS..=MAX_READ_TIMEOUT_MS).contains(&self.initial_read_timeout_ms) {
             return Err(DaemonError::ConfigInvalid);
         }
-        if self.max_connections == 0 {
+        if self.max_connections == 0 || self.max_connections > MAX_CONNECTIONS_CAP {
             return Err(DaemonError::ConfigInvalid);
         }
         if !(5..=86_400).contains(&self.tcp_idle_timeout_secs) {
@@ -669,7 +711,7 @@ impl Config {
         if !(10..=2_000).contains(&self.happy_eyeballs_delay_ms) {
             return Err(DaemonError::ConfigInvalid);
         }
-        if !(128..=65_535).contains(&self.listen_backlog) {
+        if self.listen_backlog < 128 {
             return Err(DaemonError::ConfigInvalid);
         }
         Ok(())
@@ -755,11 +797,8 @@ impl Config {
 
     /// Returns the TCP accept backlog passed to `listen(2)`.
     #[must_use]
-    pub const fn listen_backlog(&self) -> i32 {
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            self.listen_backlog as i32
-        }
+    pub fn listen_backlog(&self) -> i32 {
+        i32::from(self.listen_backlog)
     }
 
     /// Returns whether opt-in unsafe debug logging is enabled.
@@ -798,13 +837,7 @@ impl fmt::Debug for Config {
 }
 
 fn is_valid_sni_entry(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > 255 {
-        return false;
-    }
-    bytes
-        .iter()
-        .all(|b| b.is_ascii_graphic() && *b != b'*' && *b != b'\\')
+    !name.ends_with('.') && is_valid_domain(name)
 }
 
 #[cfg(test)]
@@ -889,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_performance_and_video_tuning_fields() {
+    fn parses_performance_and_video_tuning_fields() -> Result<(), DaemonError> {
         let toml = r#"
             listen_addr = "127.0.0.1:8443"
             dest_addr = "127.0.0.1:9443"
@@ -902,27 +935,28 @@ mod tests {
             happy_eyeballs_delay_ms = 60
             listen_backlog = 2048
 
+            [reality]
+            private_keys = ["1111111111111111111111111111111111111111111111111111111111111111"]
+            short_ids = ["0123abcd"]
+
             [vless]
             uuids = ["11111111-1111-4111-8111-111111111111"]
             block_quic = true
             ip_strategy = "v4_only"
         "#;
-        let parsed = Config::from_toml_str(toml);
-        assert!(parsed.is_ok());
-        if let Ok(cfg) = parsed {
-            assert_eq!(cfg.tcp_idle_timeout(), Duration::from_secs(240));
-            assert_eq!(cfg.udp_idle_timeout(), Duration::from_secs(90));
-            assert_eq!(cfg.half_close_timeout(), Duration::from_secs(8));
-            assert_eq!(cfg.tcp_keepalive(), Duration::from_secs(25));
-            assert_eq!(cfg.dest_profile_cache_ttl(), Duration::from_secs(180));
-            assert_eq!(cfg.happy_eyeballs_delay(), Duration::from_millis(60));
-            assert_eq!(cfg.listen_backlog(), 2048);
-            assert!(cfg.vless().is_some_and(VlessConfig::block_quic));
-            assert_eq!(
-                cfg.vless().map(VlessConfig::ip_strategy),
-                Some(IpStrategy::V4Only)
-            );
-        }
+        let cfg = Config::from_toml_str(toml)?;
+        assert_eq!(cfg.tcp_idle_timeout(), Duration::from_secs(240));
+        assert_eq!(cfg.udp_idle_timeout(), Duration::from_secs(90));
+        assert_eq!(cfg.half_close_timeout(), Duration::from_secs(8));
+        assert_eq!(cfg.tcp_keepalive(), Duration::from_secs(25));
+        assert_eq!(cfg.dest_profile_cache_ttl(), Duration::from_secs(180));
+        assert_eq!(cfg.happy_eyeballs_delay(), Duration::from_millis(60));
+        assert_eq!(cfg.listen_backlog(), 2048);
+        assert!(cfg.vless().is_some_and(VlessConfig::block_quic));
+        assert_eq!(
+            cfg.vless().map(VlessConfig::ip_strategy),
+            Some(IpStrategy::V4Only)
+        );
 
         let bad_backlog = r#"
             listen_addr = "127.0.0.1:8443"
@@ -931,5 +965,41 @@ mod tests {
             listen_backlog = 16
         "#;
         assert!(Config::from_toml_str(bad_backlog).is_err());
+
+        // [vless] without [reality] must be rejected (SEC-29).
+        let vless_no_reality = r#"
+            listen_addr = "127.0.0.1:8443"
+            dest_addr = "127.0.0.1:9443"
+            server_names = ["example.com"]
+
+            [vless]
+            uuids = ["11111111-1111-4111-8111-111111111111"]
+        "#;
+        assert_eq!(
+            Config::from_toml_str(vless_no_reality).err(),
+            Some(DaemonError::ConfigInvalid)
+        );
+
+        // Self-loop dest_addr == listen_addr and IP literal SNI must be rejected.
+        let self_loop = r#"
+            listen_addr = "127.0.0.1:8443"
+            dest_addr = "127.0.0.1:8443"
+            server_names = ["example.com"]
+        "#;
+        assert_eq!(
+            Config::from_toml_str(self_loop).err(),
+            Some(DaemonError::ConfigInvalid)
+        );
+
+        let ip_sni = r#"
+            listen_addr = "127.0.0.1:8443"
+            dest_addr = "127.0.0.1:9443"
+            server_names = ["127.0.0.1"]
+        "#;
+        assert_eq!(
+            Config::from_toml_str(ip_sni).err(),
+            Some(DaemonError::ConfigInvalid)
+        );
+        Ok(())
     }
 }

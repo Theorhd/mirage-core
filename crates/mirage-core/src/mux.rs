@@ -3,10 +3,12 @@
 //! Operates strictly over caller-supplied byte slices with bounded metadata
 //! lengths, zero panics, zero indexing, and `Zeroizing` payload buffers.
 
+use core::fmt;
 use core::net::{Ipv4Addr, Ipv6Addr};
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
+use crate::egress::is_valid_domain;
 use crate::vless::VlessAddress;
 
 /// Bitmask option flag indicating a 2-byte length-prefixed payload follows metadata.
@@ -91,8 +93,8 @@ pub struct MuxTarget {
     pub address: VlessAddress,
 }
 
-/// Decoded `Mux.Cool` / `XUDP` frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Decoded `Mux.Cool` / `XUDP` frame (redacted `Debug`).
+#[derive(Clone, PartialEq, Eq)]
 pub struct MuxFrame {
     /// Logical sub-session identifier (may be `0` in Single XUDP mode).
     pub id: u16,
@@ -110,8 +112,23 @@ pub struct MuxFrame {
     pub payload: Zeroizing<Vec<u8>>,
 }
 
+impl fmt::Debug for MuxFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MuxFrame")
+            .field("id", &self.id)
+            .field("status", &self.status)
+            .field("opt_data", &self.opt_data)
+            .field("opt_error", &self.opt_error)
+            .field("target", &self.target)
+            .field("has_global_id", &self.global_id.is_some())
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
+}
+
 /// Errors emitted while decoding or encoding `Mux.Cool` / `XUDP` frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MuxError {
     /// Metadata length is `< 4`, exceeds `MAX_MUX_METADATA_LEN`, or does not match inner fields.
     InvalidMetadataLen,
@@ -123,7 +140,24 @@ pub enum MuxError {
     InvalidAddress,
     /// Payload exceeds 65535 bytes.
     PayloadTooLarge,
+    /// Reserved option bits set in Mux `opt` byte.
+    InvalidOptions,
 }
+
+impl fmt::Display for MuxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMetadataLen => f.write_str("invalid Mux metadata length"),
+            Self::InvalidStatus => f.write_str("invalid Mux session status byte"),
+            Self::InvalidNetwork => f.write_str("invalid Mux target network"),
+            Self::InvalidAddress => f.write_str("invalid Mux target address"),
+            Self::PayloadTooLarge => f.write_str("Mux payload exceeds 65535 bytes"),
+            Self::InvalidOptions => f.write_str("invalid reserved Mux option bits"),
+        }
+    }
+}
+
+impl core::error::Error for MuxError {}
 
 /// Attempts to decode one complete `Mux.Cool` / `XUDP` frame from `buf`.
 ///
@@ -154,6 +188,9 @@ pub fn decode_mux_frame(buf: &[u8]) -> Result<Option<(MuxFrame, usize)>, MuxErro
     let status = *meta.get(2).ok_or(MuxError::InvalidMetadataLen)?;
     let status = MuxStatus::from_u8(status).ok_or(MuxError::InvalidStatus)?;
     let opt = *meta.get(3).ok_or(MuxError::InvalidMetadataLen)?;
+    if (opt & !(MUX_OPT_DATA | MUX_OPT_ERROR)) != 0 {
+        return Err(MuxError::InvalidOptions);
+    }
 
     let opt_data = (opt & MUX_OPT_DATA) != 0;
     let opt_error = (opt & MUX_OPT_ERROR) != 0;
@@ -223,19 +260,50 @@ pub fn decode_mux_frame(buf: &[u8]) -> Result<Option<(MuxFrame, usize)>, MuxErro
     }
 }
 
-/// Encodes `frame` directly into `out`, clearing any previous contents while
-/// preserving `out`'s existing heap capacity.
+/// Encodes `frame` directly into `out`, validating all fields before mutating `out`
+/// and clearing/zeroizing any previous contents while preserving existing capacity.
 pub fn encode_mux_frame_into(frame: &MuxFrame, out: &mut Vec<u8>) -> Result<(), MuxError> {
+    out.zeroize();
     out.clear();
+
     let has_data = frame.opt_data || !frame.payload.is_empty();
-    if frame.payload.len() > usize::from(u16::MAX) {
-        return Err(MuxError::PayloadTooLarge);
+    let pay_len_u16 = u16::try_from(frame.payload.len()).map_err(|_| MuxError::PayloadTooLarge)?;
+
+    // Validate all metadata and pre-calculate exact `meta_len` before writing into `out`.
+    let mut meta_len = 4usize;
+    if let Some(target) = &frame.target {
+        if matches!(frame.status, MuxStatus::End | MuxStatus::KeepAlive) {
+            return Err(MuxError::InvalidMetadataLen);
+        }
+        if frame.status == MuxStatus::Keep && target.network != MuxNetwork::Udp {
+            return Err(MuxError::InvalidNetwork);
+        }
+        // network (1) + port (2) + atyp (1)
+        meta_len = meta_len.saturating_add(4);
+        match &target.address {
+            VlessAddress::Ipv4(_) => meta_len = meta_len.saturating_add(4),
+            VlessAddress::Domain(domain) => {
+                if domain.len() > MAX_MUX_DOMAIN_LEN || !is_valid_domain(domain) {
+                    return Err(MuxError::InvalidAddress);
+                }
+                meta_len = meta_len.saturating_add(1).saturating_add(domain.len());
+            }
+            VlessAddress::Ipv6(_) => meta_len = meta_len.saturating_add(16),
+        }
+        if frame.global_id.is_some() {
+            if target.network != MuxNetwork::Udp {
+                return Err(MuxError::InvalidMetadataLen);
+            }
+            meta_len = meta_len.saturating_add(8);
+        }
+    } else if frame.status == MuxStatus::New || frame.global_id.is_some() {
+        return Err(MuxError::InvalidMetadataLen);
     }
 
-    // Reserve placeholder for 2-byte metadata length.
-    out.extend_from_slice(&[0u8, 0u8]);
-    out.extend_from_slice(&frame.id.to_be_bytes());
-    out.push(frame.status.to_u8());
+    if meta_len > MAX_MUX_METADATA_LEN {
+        return Err(MuxError::InvalidMetadataLen);
+    }
+    let meta_len_u16 = u16::try_from(meta_len).map_err(|_| MuxError::InvalidMetadataLen)?;
 
     let mut opt = 0u8;
     if has_data {
@@ -244,15 +312,19 @@ pub fn encode_mux_frame_into(frame: &MuxFrame, out: &mut Vec<u8>) -> Result<(), 
     if frame.opt_error {
         opt |= MUX_OPT_ERROR;
     }
+
+    let total_len = 2usize.saturating_add(meta_len).saturating_add(if has_data {
+        2usize.saturating_add(frame.payload.len())
+    } else {
+        0
+    });
+    out.reserve(total_len);
+    out.extend_from_slice(&meta_len_u16.to_be_bytes());
+    out.extend_from_slice(&frame.id.to_be_bytes());
+    out.push(frame.status.to_u8());
     out.push(opt);
 
     if let Some(target) = &frame.target {
-        if matches!(frame.status, MuxStatus::End | MuxStatus::KeepAlive) {
-            return Err(MuxError::InvalidMetadataLen);
-        }
-        if frame.status == MuxStatus::Keep && target.network != MuxNetwork::Udp {
-            return Err(MuxError::InvalidNetwork);
-        }
         out.push(target.network.to_u8());
         out.extend_from_slice(&target.port.to_be_bytes());
         match &target.address {
@@ -261,9 +333,6 @@ pub fn encode_mux_frame_into(frame: &MuxFrame, out: &mut Vec<u8>) -> Result<(), 
                 out.extend_from_slice(&v4.octets());
             }
             VlessAddress::Domain(domain) => {
-                if domain.is_empty() || domain.len() > MAX_MUX_DOMAIN_LEN || !domain.is_ascii() {
-                    return Err(MuxError::InvalidAddress);
-                }
                 let dlen = u8::try_from(domain.len()).map_err(|_| MuxError::InvalidAddress)?;
                 out.push(0x02);
                 out.push(dlen);
@@ -275,31 +344,11 @@ pub fn encode_mux_frame_into(frame: &MuxFrame, out: &mut Vec<u8>) -> Result<(), 
             }
         }
         if let Some(gid) = frame.global_id {
-            if target.network != MuxNetwork::Udp {
-                return Err(MuxError::InvalidMetadataLen);
-            }
             out.extend_from_slice(&gid);
         }
-    } else if frame.status == MuxStatus::New || frame.global_id.is_some() {
-        return Err(MuxError::InvalidMetadataLen);
-    }
-
-    let meta_len = out.len().saturating_sub(2);
-    if meta_len > MAX_MUX_METADATA_LEN {
-        return Err(MuxError::InvalidMetadataLen);
-    }
-    let meta_len_u16 = u16::try_from(meta_len).map_err(|_| MuxError::InvalidMetadataLen)?;
-    let [ml0, ml1] = meta_len_u16.to_be_bytes();
-    if let Some(slot0) = out.first_mut() {
-        *slot0 = ml0;
-    }
-    if let Some(slot1) = out.get_mut(1) {
-        *slot1 = ml1;
     }
 
     if has_data {
-        let pay_len_u16 =
-            u16::try_from(frame.payload.len()).map_err(|_| MuxError::PayloadTooLarge)?;
         out.extend_from_slice(&pay_len_u16.to_be_bytes());
         out.extend_from_slice(&frame.payload);
     }
@@ -356,14 +405,12 @@ fn parse_target_and_gid(
             cursor = cursor.saturating_add(1);
             let end = cursor.saturating_add(dlen);
             let dbytes = meta.get(cursor..end).ok_or(MuxError::InvalidAddress)?;
-            if !dbytes.is_ascii() {
+            let domain = core::str::from_utf8(dbytes).map_err(|_| MuxError::InvalidAddress)?;
+            if !is_valid_domain(domain) {
                 return Err(MuxError::InvalidAddress);
             }
-            let domain = core::str::from_utf8(dbytes)
-                .map_err(|_| MuxError::InvalidAddress)?
-                .to_owned();
             cursor = end;
-            VlessAddress::Domain(domain)
+            VlessAddress::Domain(domain.to_owned())
         }
         0x03 => {
             let end = cursor.saturating_add(16);
@@ -404,7 +451,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tcp_mux_new_keep_end_keepalive_roundtrip() {
+    fn tcp_mux_new_keep_end_keepalive_roundtrip() -> Result<(), MuxError> {
         let frames = [
             MuxFrame {
                 id: 1,
@@ -450,9 +497,7 @@ mod tests {
 
         let mut wire = Vec::new();
         for frame in &frames {
-            let Ok(enc) = encode_mux_frame(frame) else {
-                return;
-            };
+            let enc = encode_mux_frame(frame)?;
             wire.extend_from_slice(&enc);
         }
 
@@ -462,14 +507,17 @@ mod tests {
         let mut off = 0usize;
         for expected in &frames {
             let slice = wire.get(off..).unwrap_or(&[]);
-            let decoded = decode_mux_frame(slice);
-            assert!(matches!(decoded, Ok(Some(_))));
-            if let Ok(Some((frame, used))) = decoded {
-                assert_eq!(&frame, expected);
-                off = off.saturating_add(used);
-            }
+            let (frame, used) = decode_mux_frame(slice)?.ok_or(MuxError::InvalidMetadataLen)?;
+            assert_eq!(&frame, expected);
+            off = off.saturating_add(used);
         }
         assert_eq!(off, wire.len());
+        // Reserved option bit 0x04 must be rejected (SEC-36).
+        assert_eq!(
+            decode_mux_frame(&[0x00, 0x04, 0x00, 0x01, 0x04, 0x04]),
+            Err(MuxError::InvalidOptions)
+        );
+        Ok(())
     }
 
     #[test]

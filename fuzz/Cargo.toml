@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 mirage-core = { path = "../crates/mirage-core" }
+miraged = { path = "../crates/miraged" }
 
 [[bin]]
 name = "client_hello"
@@ -42,6 +43,27 @@ bench = false
 [[bin]]
 name = "mux_frame"
 path = "fuzz_targets/mux_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_response"
+path = "fuzz_targets/dns_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reality_session"
+path = "fuzz_targets/reality_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
 test = false
 doc = false
 bench = false

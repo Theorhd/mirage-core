@@ -8,6 +8,7 @@ use core::fmt;
 
 /// Sanitized operational errors for `miraged`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DaemonError {
     /// Invalid CLI arguments.
     InvalidArguments,
@@ -17,6 +18,8 @@ pub enum DaemonError {
     ConfigInvalid,
     /// Failed to disable process core dumps / dumpability.
     HardeningFailed,
+    /// Failed to obtain OS CSPRNG entropy (`getrandom`).
+    EntropyFailed,
     /// Failed to bind listening TCP socket.
     BindFailed,
     /// Failed to register OS shutdown signal handler.
@@ -32,6 +35,7 @@ impl DaemonError {
             Self::ConfigReadFailed => "failed to read configuration file",
             Self::ConfigInvalid => "configuration validation failed",
             Self::HardeningFailed => "failed to apply process hardening",
+            Self::EntropyFailed => "failed to read OS CSPRNG entropy",
             Self::BindFailed => "failed to bind listening socket",
             Self::SignalHandlerFailed => "failed to register shutdown signal handler",
         }

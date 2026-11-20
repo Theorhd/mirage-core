@@ -1,7 +1,8 @@
 //! `miraged` server binary entrypoint.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -21,6 +22,13 @@ enum CliAction {
     Serve { config_path: PathBuf },
     CheckConfig { config_path: PathBuf },
     Keygen,
+}
+
+fn validate_config_path(path: &OsStr) -> Result<PathBuf, DaemonError> {
+    if path.is_empty() || path.as_encoded_bytes().starts_with(b"--") {
+        return Err(DaemonError::InvalidArguments);
+    }
+    Ok(PathBuf::from(path))
 }
 
 fn parse_cli() -> Result<CliAction, DaemonError> {
@@ -50,7 +58,7 @@ fn parse_cli() -> Result<CliAction, DaemonError> {
                 if args.next().is_some() {
                     return Err(DaemonError::InvalidArguments);
                 }
-                PathBuf::from(path)
+                validate_config_path(&path)?
             }
             _ => return Err(DaemonError::InvalidArguments),
         };
@@ -61,16 +69,11 @@ fn parse_cli() -> Result<CliAction, DaemonError> {
         let Some(path) = args.next() else {
             return Err(DaemonError::InvalidArguments);
         };
+        let config_path = validate_config_path(&path)?;
         match args.next() {
-            None => {
-                return Ok(CliAction::Serve {
-                    config_path: PathBuf::from(path),
-                })
-            }
+            None => return Ok(CliAction::Serve { config_path }),
             Some(flag) if flag == "--check" && args.next().is_none() => {
-                return Ok(CliAction::CheckConfig {
-                    config_path: PathBuf::from(path),
-                });
+                return Ok(CliAction::CheckConfig { config_path });
             }
             _ => return Err(DaemonError::InvalidArguments),
         }
@@ -87,6 +90,7 @@ fn init_tracing(unsafe_debug_logging: bool) {
     };
 
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_max_level(max_level)
         .with_target(false)
         .with_ansi(false)
@@ -95,68 +99,93 @@ fn init_tracing(unsafe_debug_logging: bool) {
     if unsafe_debug_logging {
         tracing::warn!("unsafe_debug_logging enabled: this instance is NOT privacy-safe");
     }
+    if hardening::is_running_as_root() {
+        tracing::warn!("miraged is running as root (UID 0); prefer an unprivileged account");
+    }
 }
 
-async fn shutdown_signal() -> Result<(), DaemonError> {
+async fn wait_for_shutdown(
+    #[cfg(unix)] mut sigterm: tokio::signal::unix::Signal,
+    signal_err: &std::sync::atomic::AtomicBool,
+) {
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|_| DaemonError::SignalHandlerFailed)?;
         tokio::select! {
             res = tokio::signal::ctrl_c() => {
-                res.map_err(|_| DaemonError::SignalHandlerFailed)?;
+                if res.is_err() {
+                    signal_err.store(true, std::sync::atomic::Ordering::Release);
+                }
             }
             _ = sigterm.recv() => {}
         }
-        Ok(())
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(|_| DaemonError::SignalHandlerFailed)
+        if tokio::signal::ctrl_c().await.is_err() {
+            signal_err.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
 #[cfg(unix)]
-fn spawn_sighup_reloader(config_path: PathBuf, runtime: Arc<SharedRuntime>) {
-    if let Ok(mut sighup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-        tokio::spawn(async move {
-            while sighup.recv().await.is_some() {
-                let path = config_path.clone();
-                let load_res =
-                    tokio::task::spawn_blocking(move || Config::from_toml_file(&path)).await;
-                match load_res {
-                    Ok(Ok(new_cfg)) => {
-                        if runtime.reload(new_cfg).is_err() {
-                            tracing::warn!("configuration reload rejected");
-                        }
-                    }
-                    _ => {
-                        tracing::warn!("configuration reload failed; keeping active config");
+fn register_sighup_reloader(
+    config_path: PathBuf,
+    runtime: Arc<SharedRuntime>,
+) -> Result<(), DaemonError> {
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(|_| DaemonError::SignalHandlerFailed)?;
+    tokio::spawn(async move {
+        while sighup.recv().await.is_some() {
+            let path = config_path.clone();
+            let load_res = tokio::task::spawn_blocking(move || Config::from_toml_file(&path)).await;
+            match load_res {
+                Ok(Ok(new_cfg)) => {
+                    if runtime.reload(new_cfg).is_err() {
+                        tracing::warn!("configuration reload rejected");
                     }
                 }
+                _ => {
+                    tracing::warn!("configuration reload failed; keeping active config");
+                }
             }
-        });
-    }
+        }
+    });
+    Ok(())
 }
 
 async fn run(config_path: PathBuf, config: Config) -> Result<(), DaemonError> {
+    #[cfg(unix)]
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|_| DaemonError::SignalHandlerFailed)?;
+
     let listener = bind_tcp_listener(config.listen_addr(), config.listen_backlog())
         .map_err(|_| DaemonError::BindFailed)?;
 
     let runtime = SharedRuntime::new(config)?;
     #[cfg(unix)]
-    spawn_sighup_reloader(config_path, Arc::clone(&runtime));
+    register_sighup_reloader(config_path, Arc::clone(&runtime))?;
     #[cfg(not(unix))]
     let _ = config_path;
 
     let metrics = Arc::new(Metrics::new());
+    let signal_err = std::sync::atomic::AtomicBool::new(false);
 
-    proxy::run_server_with_reload(listener, runtime, metrics, async {
-        let _ = shutdown_signal().await;
-    })
-    .await
+    proxy::run_server_with_reload(
+        listener,
+        runtime,
+        metrics,
+        wait_for_shutdown(
+            #[cfg(unix)]
+            sigterm,
+            &signal_err,
+        ),
+    )
+    .await?;
+
+    if signal_err.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(DaemonError::SignalHandlerFailed);
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {

@@ -45,7 +45,7 @@ Unlike traditional TLS servers that hand sockets directly to `rustls` or `tokio-
          │ 1. Complete Reality TLS 1.3 flow  │ │ 1. Connect to legitimate `dest`   │
          │ 2. Parse VLESS header (UUID, Cmd) │ │ 2. Replay intact BytesMut buffer  │
          │ 3. Apply XTLS-Vision padding /    │ │ 3. Relay raw TCP bidirectionally  │
-         │    Application Data detection     │ │    (tokio::io::copy_bidirectional)│
+         │    Application Data detection     │ │    (bounded relay_direct_copy)    │
          │ 4. Route TCP/UDP to target host   │ │    -> Real cert & HTTP/2 exposed  │
          └───────────────────────────────────┘ └───────────────────────────────────┘
 ```
@@ -87,7 +87,7 @@ mirage-core/
 │           ├── mux.rs          # Mux.Cool TCP multiplexer & XUDP Full-Cone NAT table
 │           ├── outbound.rs     # Anti-SSRF multi-IP resolution & Happy Eyeballs dialing
 │           ├── dns.rs          # Private RFC 1035 DNS-over-UDP/TCP resolver
-│           ├── hardening.rs    # Core-dump disable, rlimit & privilege drop helpers
+│           ├── hardening.rs    # Core-dump disable (RLIMIT_CORE=0) & PR_SET_NO_NEW_PRIVS helpers
 │           ├── metrics.rs      # Lock-free, PII-free atomic counters
 │           └── error.rs        # Non-leaky daemon error types
 ├── SECURITY.md                 # Vulnerability disclosure policy
@@ -114,24 +114,25 @@ mirage-core/
 
 ## Docker Deployment (Prebuilt GHCR Image — No Source Code Required)
 
-Multi-architecture static `FROM scratch` images (`linux/amd64` and `linux/arm64`) are built and published automatically to GitHub Container Registry on every push to `dev` / `main` and version tags (`v*`):
+Multi-architecture static `FROM scratch` images (`linux/amd64` and `linux/arm64`) are built and published automatically to GitHub Container Registry on every push to `main` / version tags (`v*`) (plus `dev` prerelease tags):
 
 ```bash
-# Pull the hardened FROM scratch image directly on any VPS
-docker pull ghcr.io/theorhd/mirage-core:latest
+# Pull the hardened FROM scratch image directly on any VPS (prefer pinned version tag or @sha256 digest)
+docker pull ghcr.io/theorhd/mirage-core:v0.2.0
 
 # Generate Reality keys + UUIDv4 without Rust/Cargo installed
 docker run --rm --user 65534:65534 --read-only --cap-drop=ALL \
-  --security-opt no-new-privileges:true ghcr.io/theorhd/mirage-core:latest keygen
+  --security-opt no-new-privileges:true ghcr.io/theorhd/mirage-core:v0.2.0 keygen
 ```
 
 To deploy with the hardened `docker-compose.yml` profile (no repository clone needed):
 
 ```bash
-mkdir -p mirage-core/secrets && cd mirage-core
-curl -fsSLO https://raw.githubusercontent.com/Theorhd/mirage-core/dev/docker-compose.yml
-curl -fsSLO https://raw.githubusercontent.com/Theorhd/mirage-core/dev/seccomp-miraged.json
-# Place your config in ./secrets/config.toml (chmod 0400, owner 65534:65534), then:
+install -d -m 0700 mirage-core && install -d -m 0700 mirage-core/secrets && cd mirage-core
+curl -fsSLO --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/Theorhd/mirage-core/main/docker-compose.yml
+curl -fsSLO --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/Theorhd/mirage-core/main/seccomp-miraged.json
+# Verify downloaded manifests before launching, then place your config in
+# ./secrets/config.toml (install -m 0400 -o 65534 -g 65534), then:
 docker compose pull && docker compose up -d
 ```
 
@@ -143,7 +144,7 @@ docker compose pull && docker compose up -d
 2. **Non-Destructive TCP Interception**: The initial `ClientHello` is never delegated to `rustls` or `tokio-rustls`. Keeping the original TCP payload intact inside `BytesMut` guarantees that fallback relays reproduce the exact client bytes when forwarding to `dest`.
 3. **Replay & Probe Resistance**: Reality Session ID verification validates both the AEAD authentication tag (derived via X25519 + HKDF-SHA256) and a strict timestamp/ShortID window, backed by a bounded, fail-closed in-memory anti-replay cache.
 4. **Never Close, Always Delegate**: Timeouts, oversized or malformed input, unknown SNIs, failed authentication, and replays are all relayed to `dest` instead of being closed locally, so the server's behavior never diverges from the legitimate destination.
-5. **Panic-Free Parsing**: With `panic = "abort"`, any panic reachable from network input would be a remote DoS. Parsers are written without `unwrap`/indexing/unchecked arithmetic (enforced by denied clippy lints and `overflow-checks`) and continuously fuzzed.
+5. **Panic-Free Parsing**: With `panic = "abort"`, any panic reachable from network input would be a remote DoS. Parsers are written without `unwrap`/indexing/unchecked arithmetic (enforced by denied clippy lints and `overflow-checks`) and fuzz-tested with 8 libFuzzer harnesses in `fuzz/` (compile-checked in CI).
 6. **Zero-Log Privacy**: No client IPs, SNIs, credentials, destinations, or per-session metrics are logged; errors and panics are sanitized; no state, logs, or core dumps ever touch disk.
 7. **Hardened Container Runtime (`FROM scratch`)**:
    * Multi-stage static compilation against `musl` with stripped debug symbols.
@@ -159,7 +160,7 @@ Found a vulnerability? Please follow [SECURITY.md](SECURITY.md) — never open a
 * [x] **Milestone 1 — SNI Proxy & TCP Fallback**
   * Async TCP listener in `miraged` with `BytesMut` initial-packet buffering and accept-side backpressure.
   * Non-destructive TLS `ClientHello` parsing (`SNI`, `Session ID`, `key_share` incl. hybrid `X25519MLKEM768`) with multi-segment / multi-record reassembly in `mirage-core::tls_parser`.
-  * Transparent bidirectional TCP fallback (`tokio::io::copy_bidirectional`) to `dest`, applying the "never close, always delegate" rule.
+  * Transparent bidirectional TCP fallback (bounded `relay_direct_copy`) to `dest`, applying the "never close, always delegate" rule.
   * Panic-free lint set, fuzz harness, and differential probing harness (`miraged` vs `dest`).
 * [x] **Milestone 2 — Reality Cryptographic Handshake**
   * X25519 ECDH key agreement, HKDF-SHA256 key derivation, and AEAD verification (`crypto.rs`).

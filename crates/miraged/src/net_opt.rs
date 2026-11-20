@@ -13,8 +13,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Notify;
+#[cfg(target_os = "linux")]
+use tokio::sync::Semaphore;
 
 use crate::metrics::Metrics;
+
+/// Maximum concurrent Linux `splice(2)` kernel pipe pairs active across the
+/// daemon (`512` pipes = `1024` FDs and `64 MiB` kernel pipe pages). Any excess
+/// DirectCopy flows fall back transparently to 64 KiB userspace copy.
+#[cfg(target_os = "linux")]
+const MAX_ACTIVE_SPLICE_PIPES: usize = 512;
+
+#[cfg(target_os = "linux")]
+static SPLICE_PIPE_BUDGET: Semaphore = Semaphore::const_new(MAX_ACTIVE_SPLICE_PIPES);
 
 /// Userspace DirectCopy chunk size (`64 KiB`) used on non-Linux hosts or when
 /// Linux `splice(2)` is unavailable.
@@ -24,12 +35,16 @@ pub const DIRECT_COPY_CHUNK_SIZE: usize = 64 * 1024;
 /// The OS kernel silently clamps this to `net.core.{rmem,wmem}_max`.
 pub const UDP_SOCKET_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
-/// Creates and binds a non-blocking `TcpListener` with `SO_REUSEADDR` and an
+/// Creates and binds a non-blocking `TcpListener` with `SO_REUSEADDR` (Unix) and an
 /// explicit accept backlog (minimum `128`).
 pub fn bind_tcp_listener(addr: SocketAddr, backlog: i32) -> io::Result<TcpListener> {
     let domain = Domain::for_address(addr);
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(unix)]
     socket.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        let _ = socket.set_only_v6(!addr.ip().is_unspecified());
+    }
     socket.set_nonblocking(true)?;
     socket.bind(&SockAddr::from(addr))?;
     socket.listen(backlog.max(128))?;
@@ -119,14 +134,14 @@ impl HalfCloseSignal {
     #[inline]
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// Marks the relay as half-closed and wakes any in-flight `idle_timeout` wait
     /// so it tightens immediately to `half_close_timeout`.
     #[inline]
     pub fn mark_closed(&self) {
-        if !self.closed.swap(true, Ordering::Release) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
             self.notify.notify_waiters();
         }
     }
@@ -178,6 +193,7 @@ where
     };
 
     tokio::select! {
+        biased;
         res = fut => Ok(res),
         () = deadline => Err(RelayElapsed),
     }
@@ -260,7 +276,7 @@ async fn userspace_direct_copy(
                     Ok(Err(err)) => return Err(err),
                     Err(RelayElapsed) => {
                         metrics.inc_idle_timeouts();
-                        return Ok(());
+                        return Err(io::Error::from(io::ErrorKind::TimedOut));
                     }
                 }
             }
@@ -308,6 +324,9 @@ async fn splice_direct_copy(
     use rustix::pipe::{fcntl_setpipe_size, pipe_with, splice, PipeFlags, SpliceFlags};
     use tokio::io::Interest;
 
+    let Ok(_pipe_permit) = SPLICE_PIPE_BUDGET.try_acquire() else {
+        return Err(SpliceOutcome::Unsupported);
+    };
     let (pipe_r, pipe_w) = pipe_with(PipeFlags::NONBLOCK | PipeFlags::CLOEXEC)
         .map_err(|_| SpliceOutcome::Unsupported)?;
     let _ = fcntl_setpipe_size(&pipe_w, SPLICE_PIPE_SIZE);
@@ -337,7 +356,7 @@ async fn splice_direct_copy(
             }
 
             let mut unsupported = false;
-            let res = reader.as_ref().try_io(Interest::READABLE, || {
+            let res = reader.as_ref().try_io(Interest::READABLE, || loop {
                 match splice(
                     reader.as_ref(),
                     None,
@@ -346,17 +365,18 @@ async fn splice_direct_copy(
                     SPLICE_CHUNK_SIZE,
                     flags,
                 ) {
-                    Ok(n) => Ok(n),
+                    Ok(n) => return Ok(n),
+                    Err(rustix::io::Errno::INTR) => continue,
                     Err(e)
                         if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::WOULDBLOCK =>
                     {
-                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
                     }
                     Err(e) if is_splice_unsupported(e) => {
                         unsupported = true;
-                        Err(io::Error::from(io::ErrorKind::Unsupported))
+                        return Err(io::Error::from(io::ErrorKind::Unsupported));
                     }
-                    Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error())),
+                    Err(e) => return Err(io::Error::from_raw_os_error(e.raw_os_error())),
                 }
             });
 
@@ -389,19 +409,20 @@ async fn splice_direct_copy(
                 Ok(Err(err)) => return Err(SpliceOutcome::Io(err)),
                 Err(RelayElapsed) => {
                     metrics.inc_idle_timeouts();
-                    return Ok(());
+                    return Err(SpliceOutcome::Io(io::Error::from(io::ErrorKind::TimedOut)));
                 }
             }
 
-            let res = writer.as_ref().try_io(Interest::WRITABLE, || {
+            let res = writer.as_ref().try_io(Interest::WRITABLE, || loop {
                 match splice(&pipe_r, None, writer.as_ref(), None, in_pipe, flags) {
-                    Ok(n) => Ok(n),
+                    Ok(n) => return Ok(n),
+                    Err(rustix::io::Errno::INTR) => continue,
                     Err(e)
                         if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::WOULDBLOCK =>
                     {
-                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
                     }
-                    Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error())),
+                    Err(e) => return Err(io::Error::from_raw_os_error(e.raw_os_error())),
                 }
             });
 
@@ -424,13 +445,9 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn binds_listener_tunes_sockets_and_relays_direct_copy() {
-        let Ok(listener) = bind_tcp_listener(SocketAddr::from(([127, 0, 0, 1], 0)), 1024) else {
-            return;
-        };
-        let Ok(addr) = listener.local_addr() else {
-            return;
-        };
+    async fn binds_listener_tunes_sockets_and_relays_direct_copy() -> io::Result<()> {
+        let listener = bind_tcp_listener(SocketAddr::from(([127, 0, 0, 1], 0)), 1024)?;
+        let addr = listener.local_addr()?;
 
         let server = tokio::spawn(async move {
             let Ok((stream, _)) = listener.accept().await else {
@@ -452,16 +469,14 @@ mod tests {
             let _ = w.shutdown().await;
         });
 
-        let Ok(mut client) = TcpStream::connect(addr).await else {
-            return;
-        };
+        let mut client = TcpStream::connect(addr).await?;
         tune_tcp_stream(&client, Duration::from_secs(30));
         let payload = vec![0x5Au8; 96 * 1024];
-        assert!(client.write_all(&payload).await.is_ok());
-        assert!(client.shutdown().await.is_ok());
+        client.write_all(&payload).await?;
+        client.shutdown().await?;
 
         let mut echoed = Vec::new();
-        assert!(client.read_to_end(&mut echoed).await.is_ok());
+        client.read_to_end(&mut echoed).await?;
         assert_eq!(echoed, payload);
 
         if let Ok(udp) = UdpSocket::bind("127.0.0.1:0").await {
@@ -469,6 +484,7 @@ mod tests {
         }
 
         let _ = server.await;
+        Ok(())
     }
 
     #[tokio::test]

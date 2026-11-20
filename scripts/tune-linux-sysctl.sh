@@ -52,12 +52,9 @@ net.ipv4.udp_wmem_min = 16384
 net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 8192
 net.ipv4.tcp_max_syn_backlog = 4096
-
-# Allow unprivileged UID 65534 (Docker host-network miraged) to bind TCP/443 directly
-net.ipv4.ip_unprivileged_port_start = 443
 EOF
 
-sysctl --system >/dev/null
+sysctl -p "$SYSCTL_FILE" >/dev/null
 
 printf '[+] Profil sysctl appliqué : %s\n' "$SYSCTL_FILE"
 printf '    tcp_congestion_control = %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control)"

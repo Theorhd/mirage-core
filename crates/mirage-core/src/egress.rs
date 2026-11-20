@@ -1,14 +1,26 @@
 //! Sans-I/O anti-SSRF egress policy evaluated on resolved destination IPs.
 //!
-//! Normalizes IPv4-mapped (`::ffff:0:0/96`) and NAT64 (`64:ff9b::/96`,
-//! `64:ff9b:1::/48`) IPv6 addresses to IPv4 before checking deny-lists, blocks
+//! Normalizes IPv4-mapped (`::ffff:0:0/96`) and well-known NAT64 (`64:ff9b::/96`)
+//! IPv6 addresses to IPv4 before checking deny-lists, rejects local-use NAT64
+//! (`64:ff9b:1::/48`) and non-global IPv6 space outside `2000::/3`, blocks
 //! private/loopback/link-local/metadata/multicast ranges, blocks daemon listen
 //! addresses, and blocks TCP port 25 (SMTP) by default.
 
+use core::fmt;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+/// Transport protocol evaluated by [`EgressPolicy::validate_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportProtocol {
+    /// TCP stream (`SO_STREAM`).
+    Tcp,
+    /// UDP datagram flow.
+    Udp,
+}
 
 /// Reason an outbound VLESS target was denied by egress policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EgressError {
     /// Destination IP falls within a denied private, loopback, metadata, or reserved range.
     DeniedIpRange,
@@ -17,6 +29,18 @@ pub enum EgressError {
     /// Destination port (e.g. TCP/25 SMTP) is denied by default policy.
     DeniedPort,
 }
+
+impl fmt::Display for EgressError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeniedIpRange => f.write_str("destination IP falls in a denied range"),
+            Self::DeniedSelfAddress => f.write_str("destination IP matches a local/self address"),
+            Self::DeniedPort => f.write_str("destination port is denied by egress policy"),
+        }
+    }
+}
+
+impl core::error::Error for EgressError {}
 
 /// Configurable anti-SSRF egress policy applied after DNS resolution.
 #[derive(Debug, Clone, Default)]
@@ -37,28 +61,35 @@ impl EgressPolicy {
     /// Validates a resolved `(IpAddr, port)` target before opening an outbound
     /// socket. Always connect directly to the returned `SocketAddr` without
     /// re-resolving DNS to prevent DNS rebinding.
+    ///
+    /// IPv4-mapped IPv6 addresses (`::ffff:0:0/96`) are canonicalized to `IpAddr::V4`
+    /// so downstream self-loop comparisons cannot be bypassed via IPv6 notation.
     pub fn validate_target(
         &self,
         ip: IpAddr,
         port: u16,
-        is_tcp: bool,
+        proto: TransportProtocol,
     ) -> Result<SocketAddr, EgressError> {
         if port == 0 {
             return Err(EgressError::DeniedPort);
         }
-        if is_tcp && port == 25 && !self.allow_smtp_port_25 {
+        if proto == TransportProtocol::Tcp && port == 25 && !self.allow_smtp_port_25 {
             return Err(EgressError::DeniedPort);
         }
-        if !is_tcp && port == 443 && self.block_quic {
+        if proto == TransportProtocol::Udp && port == 443 && self.block_quic {
             return Err(EgressError::DeniedPort);
         }
-        if self.is_self_blocked(ip) {
+        let canonical_ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            IpAddr::V4(_) => ip,
+        };
+        if self.is_self_blocked(canonical_ip) {
             return Err(EgressError::DeniedSelfAddress);
         }
-        if !self.allow_private_egress && !is_public_ip(ip) {
+        if !self.allow_private_egress && !is_public_ip(canonical_ip) {
             return Err(EgressError::DeniedIpRange);
         }
-        Ok(SocketAddr::new(ip, port))
+        Ok(SocketAddr::new(canonical_ip, port))
     }
 
     fn is_self_blocked(&self, ip: IpAddr) -> bool {
@@ -67,6 +98,36 @@ impl EgressPolicy {
             .iter()
             .any(|blocked| *blocked == ip || normalize_ip(*blocked) == norm)
     }
+}
+
+/// Validates a DNS domain name against strict RFC 1035 / RFC 1123 host rules:
+/// - Total length `1..=253` (after optional single trailing `.`)
+/// - Each label `1..=63` ASCII characters in `[A-Za-z0-9_-]`
+/// - Rejects IPv4 literals, control characters, whitespace, slashes, and `..`
+#[must_use]
+pub fn is_valid_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 254 {
+        return false;
+    }
+    let trimmed = domain.strip_suffix('.').unwrap_or(domain);
+    if trimmed.is_empty() || trimmed.len() > 253 || trimmed.ends_with('.') {
+        return false;
+    }
+    if trimmed.parse::<Ipv4Addr>().is_ok() {
+        return false;
+    }
+    for label in trimmed.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Normalizes IPv4-mapped, SIIT IPv4-translated, IPv4-compatible, and NAT64 IPv6
@@ -143,32 +204,15 @@ fn extract_embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 
 fn extract_nat64_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let segs = v6.segments();
-    // Well-known NAT64 prefix: 64:ff9b::/96
-    let is_well_known = segs.first() == Some(&0x0064)
-        && segs.get(1) == Some(&0xff9b)
-        && segs.get(2) == Some(&0)
-        && segs.get(3) == Some(&0)
-        && segs.get(4) == Some(&0)
-        && segs.get(5) == Some(&0);
-    // Local-use NAT64 prefix: 64:ff9b:1::/48
-    let is_local_use = segs.first() == Some(&0x0064)
-        && segs.get(1) == Some(&0xff9b)
-        && segs.get(2) == Some(&0x0001);
-
-    if is_well_known || is_local_use {
-        let hi = *segs.get(6)?;
-        let lo = *segs.get(7)?;
-        let hi_b = hi.to_be_bytes();
-        let lo_b = lo.to_be_bytes();
-        Some(Ipv4Addr::new(
-            *hi_b.first()?,
-            *hi_b.get(1)?,
-            *lo_b.first()?,
-            *lo_b.get(1)?,
-        ))
-    } else {
-        None
-    }
+    // Well-known NAT64 prefix ONLY: 64:ff9b::/96 (RFC 6052).
+    // Local-use NAT64 (64:ff9b:1::/48, RFC 8215) supports variable-length prefixes
+    // and must NOT be unwrapped as a /96; it is denied by the 2000::/3 IPv6 allowlist.
+    let [0x0064, 0xff9b, 0, 0, 0, 0, hi, lo] = segs else {
+        return None;
+    };
+    let [h0, h1] = hi.to_be_bytes();
+    let [l0, l1] = lo.to_be_bytes();
+    Some(Ipv4Addr::new(h0, h1, l0, l1))
 }
 
 #[must_use]
@@ -231,28 +275,16 @@ const fn is_public_ipv4(v4: Ipv4Addr) -> bool {
 
 #[must_use]
 const fn is_public_ipv6(v6: Ipv6Addr) -> bool {
-    let segs = v6.segments();
-    let s0 = segs[0];
-    let s1 = segs[1];
+    let [s0, s1, ..] = v6.segments();
 
-    // 0000::/8 (IANA reserved by protocol, includes ::/128, ::1/128, ::/96 IPv4-compatible, and SIIT ::ffff:0:0/96)
-    if (s0 & 0xFF00) == 0x0000 {
+    // Strict allowlist: only IANA Global Unicast space (2000::/3) is permitted.
+    // This denies 0000::/8, 0100::/64, 64:ff9b:1::/48, 0200::/7, 4000::/2,
+    // 5f00::/16, fc00::/7 (ULA), fe00::/9, fe80::/10, fec0::/10, and ff00::/8.
+    if (s0 & 0xE000) != 0x2000 {
         return false;
     }
-    // 100::/64 (discard-only, RFC 6666)
-    if s0 == 0x0100 && s1 == 0 && segs[2] == 0 && segs[3] == 0 {
-        return false;
-    }
-    // 2001::/32 (Teredo, RFC 4380)
-    if s0 == 0x2001 && s1 == 0 {
-        return false;
-    }
-    // 2001:2::/48 (Benchmarking, RFC 5180)
-    if s0 == 0x2001 && s1 == 0x0002 && segs[2] == 0 {
-        return false;
-    }
-    // 2001:10::/28 & 2001:20::/28 (ORCHID / ORCHIDv2, RFC 4843 / RFC 7343)
-    if s0 == 0x2001 && ((s1 & 0xFFF0) == 0x0010 || (s1 & 0xFFF0) == 0x0020) {
+    // 2001::/23 (IETF protocol assignments: Teredo, Benchmarking, ORCHID/v2, 2001:30::/28, etc.)
+    if s0 == 0x2001 && (s1 & 0xFE00) == 0x0000 {
         return false;
     }
     // 2001:db8::/32 (documentation, RFC 3849)
@@ -267,35 +299,16 @@ const fn is_public_ipv6(v6: Ipv6Addr) -> bool {
     if s0 == 0x3FFF && (s1 & 0xF000) == 0x0000 {
         return false;
     }
-    // 5f00::/16 (SRv6 SIDs, RFC 9602)
-    if s0 == 0x5F00 {
-        return false;
-    }
-    // fc00::/7 (ULA, RFC 4193)
-    if (s0 & 0xFE00) == 0xFC00 {
-        return false;
-    }
-    // fe80::/10 (link-local)
-    if (s0 & 0xFFC0) == 0xFE80 {
-        return false;
-    }
-    // fec0::/10 (deprecated site-local)
-    if (s0 & 0xFFC0) == 0xFEC0 {
-        return false;
-    }
-    // ff00::/8 (multicast)
-    if (s0 & 0xFF00) == 0xFF00 {
-        return false;
-    }
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::net::AddrParseError;
 
     #[test]
-    fn denies_all_private_metadata_nat64_and_smtp_targets() {
+    fn denies_all_private_metadata_nat64_and_smtp_targets() -> Result<(), AddrParseError> {
         let policy = EgressPolicy {
             allow_private_egress: false,
             allow_smtp_port_25: false,
@@ -328,16 +341,21 @@ mod tests {
             ("::ffff:169.254.169.254", 80),
             ("64:ff9b::10.0.0.1", 443),
             ("64:ff9b:1::192.168.1.1", 443),
+            ("64:ff9b:1::1.1.1.1", 443),
+            ("64:ff9b:1:a9fe:00a9:fe00:0101:0101", 443),
             ("100::1", 443),
+            ("100:0:0:1::1", 443),
             ("2001::1", 443),
             ("2001:2::1", 443),
             ("2001:10::1", 443),
             ("2001:20::1", 443),
+            ("2001:30::1", 443),
             ("2001:db8::1", 443),
             ("2002:0a00:0001::1", 443),
             ("3fff::1", 443),
             ("5f00::1", 443),
             ("fc00::1", 443),
+            ("fe00::1", 443),
             ("fe80::1", 443),
             ("fec0::1", 443),
             ("ff02::1", 443),
@@ -346,13 +364,11 @@ mod tests {
         ];
 
         for (ip_str, port) in denied_cases {
-            let parsed = ip_str.parse::<IpAddr>();
-            assert!(parsed.is_ok(), "invalid test IP {ip_str}");
-            let Ok(ip) = parsed else {
-                return;
-            };
+            let ip: IpAddr = ip_str.parse()?;
             assert!(
-                policy.validate_target(ip, port, true).is_err(),
+                policy
+                    .validate_target(ip, port, TransportProtocol::Tcp)
+                    .is_err(),
                 "expected {ip_str}:{port} to be denied"
             );
         }
@@ -361,20 +377,33 @@ mod tests {
             ("1.1.1.1", 443),
             ("8.8.8.8", 53),
             ("2606:4700:4700::1111", 443),
+            ("2001:4860:4860::8888", 443),
             ("64:ff9b::1.1.1.1", 443),
             ("::ffff:1.1.1.1", 443),
         ];
         for (ip_str, port) in allowed_cases {
-            let parsed = ip_str.parse::<IpAddr>();
-            assert!(parsed.is_ok(), "invalid test IP {ip_str}");
-            let Ok(ip) = parsed else {
-                return;
-            };
+            let ip: IpAddr = ip_str.parse()?;
             assert!(
-                policy.validate_target(ip, port, true).is_ok(),
+                policy
+                    .validate_target(ip, port, TransportProtocol::Tcp)
+                    .is_ok(),
                 "expected {ip_str}:{port} to be allowed"
             );
         }
+
+        // IPv4-mapped IPv6 addresses must canonicalize to IPv4 so self-loop checks apply.
+        let v4_mapped_loop: IpAddr = "::ffff:127.0.0.1".parse()?;
+        let priv_policy = EgressPolicy {
+            allow_private_egress: true,
+            allow_smtp_port_25: false,
+            block_quic: false,
+            blocked_ips: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        };
+        assert_eq!(
+            priv_policy.validate_target(v4_mapped_loop, 443, TransportProtocol::Tcp),
+            Err(EgressError::DeniedSelfAddress)
+        );
+        Ok(())
     }
 
     #[test]
@@ -387,10 +416,28 @@ mod tests {
         };
         let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
         assert_eq!(
-            policy.validate_target(ip, 443, false),
+            policy.validate_target(ip, 443, TransportProtocol::Udp),
             Err(EgressError::DeniedPort)
         );
-        assert!(policy.validate_target(ip, 443, true).is_ok());
-        assert!(policy.validate_target(ip, 53, false).is_ok());
+        assert!(policy
+            .validate_target(ip, 443, TransportProtocol::Tcp)
+            .is_ok());
+        assert!(policy
+            .validate_target(ip, 53, TransportProtocol::Udp)
+            .is_ok());
+    }
+
+    #[test]
+    fn domain_validation_rejects_control_chars_ip_literals_and_bad_labels() {
+        assert!(is_valid_domain("example.com"));
+        assert!(is_valid_domain("cdn-01._tls.example.com."));
+        assert!(!is_valid_domain(""));
+        assert!(!is_valid_domain("."));
+        assert!(!is_valid_domain("example.com.."));
+        assert!(!is_valid_domain("127.0.0.1"));
+        assert!(!is_valid_domain("bad/host.com"));
+        assert!(!is_valid_domain("bad\0host.com"));
+        assert!(!is_valid_domain("bad host.com"));
+        assert!(!is_valid_domain(&"a".repeat(64)));
     }
 }

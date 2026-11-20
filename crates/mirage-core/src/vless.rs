@@ -6,9 +6,12 @@
 
 use core::fmt;
 use core::net::{Ipv4Addr, Ipv6Addr};
+use core::str::FromStr;
 
 use subtle::{Choice, ConstantTimeEq};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use crate::egress::is_valid_domain;
 
 /// Supported VLESS wire version.
 pub const VLESS_VERSION_0: u8 = 0x00;
@@ -37,12 +40,27 @@ impl VlessUuid {
     /// Parses a UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` or 32 hex chars).
     pub fn from_str_hex(input: &str) -> Result<Self, VlessError> {
         let trimmed = input.trim();
-        let mut raw = [0u8; 16];
-        let mut nibbles = [0u8; 32];
+        let bytes = trimmed.as_bytes();
+        let has_hyphens = match bytes.len() {
+            32 => false,
+            36 => {
+                if bytes.get(8) != Some(&b'-')
+                    || bytes.get(13) != Some(&b'-')
+                    || bytes.get(18) != Some(&b'-')
+                    || bytes.get(23) != Some(&b'-')
+                {
+                    return Err(VlessError::InvalidUuidFormat);
+                }
+                true
+            }
+            _ => return Err(VlessError::InvalidUuidFormat),
+        };
+
+        let mut nibbles = Zeroizing::new([0u8; 32]);
         let mut count = 0usize;
 
-        for b in trimmed.bytes() {
-            if b == b'-' {
+        for (idx, &b) in bytes.iter().enumerate() {
+            if has_hyphens && matches!(idx, 8 | 13 | 18 | 23) {
                 continue;
             }
             let val = match b {
@@ -59,10 +77,10 @@ impl VlessUuid {
         }
 
         if count != 32 {
-            nibbles.zeroize();
             return Err(VlessError::InvalidUuidFormat);
         }
 
+        let mut raw = Zeroizing::new([0u8; 16]);
         for (i, dst) in raw.iter_mut().enumerate() {
             let hi_idx = i.saturating_mul(2);
             let lo_idx = hi_idx.saturating_add(1);
@@ -70,11 +88,8 @@ impl VlessUuid {
             let lo = *nibbles.get(lo_idx).ok_or(VlessError::InvalidUuidFormat)?;
             *dst = (hi << 4) | lo;
         }
-        nibbles.zeroize();
 
-        let out = Self::from_bytes(raw);
-        raw.zeroize();
-        Ok(out)
+        Ok(Self::from_bytes(*raw))
     }
 
     /// Returns the raw 16-byte UUID slice.
@@ -83,10 +98,30 @@ impl VlessUuid {
         &self.bytes
     }
 
+    /// Constant-time comparison against another 16-byte UUID slice, returning `subtle::Choice`.
+    #[must_use]
+    pub fn ct_eq_bytes_choice(&self, other: &[u8; 16]) -> Choice {
+        self.bytes.as_slice().ct_eq(other.as_slice())
+    }
+
     /// Constant-time comparison against another 16-byte UUID slice.
     #[must_use]
     pub fn ct_eq_bytes(&self, other: &[u8; 16]) -> bool {
-        bool::from(self.bytes.as_slice().ct_eq(other.as_slice()))
+        bool::from(self.ct_eq_bytes_choice(other))
+    }
+}
+
+impl ConstantTimeEq for VlessUuid {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.bytes.as_slice().ct_eq(other.bytes.as_slice())
+    }
+}
+
+impl FromStr for VlessUuid {
+    type Err = VlessError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_str_hex(s)
     }
 }
 
@@ -131,6 +166,8 @@ impl Zeroize for VlessAddress {
             Self::Domain(dom) => dom.zeroize(),
             Self::Ipv6(v6) => *v6 = Ipv6Addr::UNSPECIFIED,
         }
+        // Prevent dead-store elimination when zeroizing immediately before Drop.
+        core::hint::black_box(&*self);
     }
 }
 
@@ -183,6 +220,7 @@ impl fmt::Debug for VlessRequest {
 
 /// Errors encountered while decoding or validating a VLESS header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VlessError {
     /// Invalid UUID string syntax.
     InvalidUuidFormat,
@@ -203,6 +241,24 @@ pub enum VlessError {
     /// UDP packet framing exceeded maximum length.
     MalformedUdpPacket,
 }
+
+impl fmt::Display for VlessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUuidFormat => f.write_str("invalid VLESS UUID format"),
+            Self::UnsupportedVersion => f.write_str("unsupported VLESS protocol version"),
+            Self::UnauthorizedUuid => f.write_str("unauthorized VLESS UUID"),
+            Self::MalformedAddons => f.write_str("malformed VLESS addons protobuf"),
+            Self::UnsupportedFlow => f.write_str("unsupported VLESS flow addon"),
+            Self::UnsupportedCommand => f.write_str("unsupported VLESS command"),
+            Self::MalformedAddress => f.write_str("malformed VLESS target address"),
+            Self::InvalidVisionUdp => f.write_str("Vision flow is invalid for non-443 UDP"),
+            Self::MalformedUdpPacket => f.write_str("malformed VLESS UDP packet"),
+        }
+    }
+}
+
+impl core::error::Error for VlessError {}
 
 /// Result of attempting to parse a VLESS request header from a buffered slice.
 #[derive(Debug)]
@@ -238,10 +294,10 @@ pub fn parse_vless_request(buf: &mut [u8], allowed_uuids: &[VlessUuid]) -> Vless
     let mut uuid_raw = [0u8; 16];
     uuid_raw.copy_from_slice(uuid_slice);
 
-    // Constant-time scan over every allowed UUID without early exit.
+    // Constant-time scan over every allowed UUID without early exit or bool roundtrip.
     let mut matched = Choice::from(0u8);
     for allowed in allowed_uuids {
-        matched |= Choice::from(u8::from(allowed.ct_eq_bytes(&uuid_raw)));
+        matched |= allowed.ct_eq_bytes_choice(&uuid_raw);
     }
     if !bool::from(matched) {
         uuid_raw.zeroize();
@@ -295,11 +351,17 @@ pub fn parse_vless_request(buf: &mut [u8], allowed_uuids: &[VlessUuid]) -> Vless
     };
 
     let (address, port, header_len) = match command {
-        VlessCommand::Mux => (
-            VlessAddress::Domain("v1.mux.cool".to_owned()),
-            0u16,
-            min_with_cmd,
-        ),
+        VlessCommand::Mux => {
+            if flow != VlessFlow::None {
+                uuid_raw.zeroize();
+                return VlessParseOutcome::Invalid(VlessError::UnsupportedFlow);
+            }
+            (
+                VlessAddress::Domain("v1.mux.cool".to_owned()),
+                0u16,
+                min_with_cmd,
+            )
+        }
         VlessCommand::Tcp | VlessCommand::Udp => {
             let Some(after_cmd) = buf.get(min_with_cmd..) else {
                 uuid_raw.zeroize();
@@ -454,6 +516,9 @@ fn read_varint(data: &[u8], start: usize) -> Result<(u64, usize), VlessError> {
     for _ in 0..10 {
         let b = *data.get(idx).ok_or(VlessError::MalformedAddons)?;
         idx = idx.saturating_add(1);
+        if shift == 63 && b > 0x01 {
+            return Err(VlessError::MalformedAddons);
+        }
         let low = u64::from(b & 0x7F);
         let shifted = low.checked_shl(shift).ok_or(VlessError::MalformedAddons)?;
         val |= shifted;
@@ -504,7 +569,7 @@ fn parse_port_then_address(buf: &[u8]) -> Result<Option<(VlessAddress, u16, usiz
             };
             let dom_str =
                 core::str::from_utf8(dom_bytes).map_err(|_| VlessError::MalformedAddress)?;
-            if !dom_str.bytes().all(|b| b.is_ascii_graphic() && b != b'\\') {
+            if !is_valid_domain(dom_str) {
                 return Err(VlessError::MalformedAddress);
             }
             Ok(Some((
@@ -559,10 +624,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_vless_vision_request_and_wipes_header_bytes() {
-        let Ok(uuid) = VlessUuid::from_str_hex("11223344-5566-7788-99aa-bbccddeeff00") else {
-            return;
-        };
+    fn parses_vless_vision_request_and_wipes_header_bytes() -> Result<(), VlessError> {
+        let uuid: VlessUuid = "11223344-5566-7788-99aa-bbccddeeff00".parse()?;
         let mut pkt =
             build_vless_tcp_domain_packet(uuid.as_bytes(), "xtls-rprx-vision", "example.com", 443);
 
@@ -600,13 +663,17 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn rejects_unauthorized_uuid_and_non_443_udp_vision() {
-        let Ok(allowed) = VlessUuid::from_str_hex("11223344-5566-7788-99aa-bbccddeeff00") else {
-            return;
-        };
+    fn rejects_unauthorized_uuid_and_non_443_udp_vision() -> Result<(), VlessError> {
+        let allowed = VlessUuid::from_str_hex("11223344-5566-7788-99aa-bbccddeeff00")?;
+        // Misplaced hyphens must be rejected.
+        assert_eq!(
+            VlessUuid::from_str_hex("112233445566-7788-99aa-bbcc-ddeeff00").err(),
+            Some(VlessError::InvalidUuidFormat)
+        );
         let mut bad = build_vless_tcp_domain_packet(&[0xFFu8; 16], "", "example.com", 443);
         assert!(matches!(
             parse_vless_request(&mut bad, core::slice::from_ref(&allowed)),
@@ -627,17 +694,38 @@ mod tests {
         udp_pkt.extend_from_slice(&[1, 1, 1, 1]);
 
         assert!(matches!(
-            parse_vless_request(&mut udp_pkt, &[allowed]),
+            parse_vless_request(&mut udp_pkt, core::slice::from_ref(&allowed)),
             VlessParseOutcome::Invalid(VlessError::InvalidVisionUdp)
         ));
+
+        // Mux + Vision must be rejected at parse time (SEC-45).
+        let mut mux_vision = Vec::new();
+        mux_vision.push(0x00);
+        mux_vision.extend_from_slice(allowed.as_bytes());
+        mux_vision.push((2usize.saturating_add(flow.len())) as u8);
+        mux_vision.push(0x0A);
+        mux_vision.push(flow.len() as u8);
+        mux_vision.extend_from_slice(flow);
+        mux_vision.push(0x03); // Mux
+        assert!(matches!(
+            parse_vless_request(&mut mux_vision, &[allowed]),
+            VlessParseOutcome::Invalid(VlessError::UnsupportedFlow)
+        ));
+
+        // Varint 10th byte > 0x01 must fail (SEC-35).
+        let over_varint = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        assert_eq!(
+            read_varint(&over_varint, 0),
+            Err(VlessError::MalformedAddons)
+        );
+        Ok(())
     }
 
     #[test]
-    fn udp_packet_framing_roundtrip() {
-        let Ok(encoded) = encode_udp_packet(b"dns-query") else {
-            return;
-        };
+    fn udp_packet_framing_roundtrip() -> Result<(), VlessError> {
+        let encoded = encode_udp_packet(b"dns-query")?;
         let decoded = decode_udp_packet(&encoded);
         assert_eq!(decoded, Ok(Some((b"dns-query".to_vec(), encoded.len()))));
+        Ok(())
     }
 }

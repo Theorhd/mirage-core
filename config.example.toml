@@ -30,7 +30,7 @@ half_close_timeout_secs = 10
 tcp_keepalive_secs = 30
 
 # Cache `dest` TLS 1.3 handshake profile in RAM to eliminate per-connection
-# RTT + 40 ms dest probing on authenticated clients (0 disables caching).
+# RTT + 200 ms dest probing on authenticated clients (0 disables caching).
 dest_profile_cache_ttl_secs = 120
 
 # Happy Eyeballs head-start delay between address-family dial attempts (ms).
@@ -48,7 +48,7 @@ private_keys = [
 
 # Non-empty hex ShortIDs (2..=16 hex chars, one per user/device).
 short_ids = [
-    "0123456789abcdef",
+    "REPLACE_WITH_HEX_SHORT_ID",
 ]
 
 # Replay protection window (seconds; host must run authenticated NTP/NTS).
@@ -61,7 +61,7 @@ replay_cache_capacity = 65536
 [vless]
 # Authorized client UUIDv4 values (one per user/device).
 uuids = [
-    "00000000-0000-4000-8000-000000000000",
+    "REPLACE_WITH_UUID_V4",
 ]
 
 # Anti-SSRF defaults (keep both false in production).

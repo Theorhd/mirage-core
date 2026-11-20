@@ -1,4 +1,5 @@
 #![no_main]
+#![forbid(unsafe_code)]
 
 use libfuzzer_sys::fuzz_target;
 use mirage_core::tls_parser::{inspect_client_hello, DEFAULT_MAX_CLIENT_HELLO_BYTES};

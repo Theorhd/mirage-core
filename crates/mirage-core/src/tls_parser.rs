@@ -59,7 +59,7 @@ const TLS_CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 const TLS_HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 
 /// TLS 1.3 `HelloRetryRequest` special random value (RFC 8446 §4.1.3).
-const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+pub const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
@@ -227,7 +227,7 @@ impl OfferedAlpn {
 }
 
 /// Parsed fields of a TLS `ClientHello` required for SNI routing and Reality auth.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ClientHelloInfo {
     /// Legacy `ClientHello.client_version` field (typically `0x0303`).
     pub legacy_version: u16,
@@ -243,6 +243,8 @@ pub struct ClientHelloInfo {
     pub key_shares: KeyShares,
     /// Whether `supported_versions` advertises TLS 1.3 (`0x0304`).
     pub offers_tls13: bool,
+    /// First recognized TLS 1.3 cipher suite offered by the client (for profile keying).
+    pub preferred_tls13_cipher: Option<Tls13CipherSuiteId>,
     /// Bitmask of TLS 1.3 cipher suites offered by the client
     /// (bit 0 = AES_128_GCM_SHA256, bit 1 = AES_256_GCM_SHA384, bit 2 = CHACHA20_POLY1305_SHA256).
     pub offered_tls13_ciphers: u8,
@@ -252,7 +254,35 @@ pub struct ClientHelloInfo {
     pub handshake_raw: Vec<u8>,
 }
 
+impl core::fmt::Debug for ClientHelloInfo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ClientHelloInfo")
+            .field("legacy_version", &self.legacy_version)
+            .field("random", &"[REDACTED]")
+            .field("session_id", &self.session_id)
+            .field("sni", &self.sni)
+            .field("offered_alpn", &self.offered_alpn)
+            .field("offers_tls13", &self.offers_tls13)
+            .field("preferred_tls13_cipher", &self.preferred_tls13_cipher)
+            .field("offered_tls13_ciphers", &self.offered_tls13_ciphers)
+            .field("wire_bytes_len", &self.wire_bytes_len)
+            .field("handshake_raw_len", &self.handshake_raw.len())
+            .finish()
+    }
+}
+
 impl ClientHelloInfo {
+    /// Returns `true` if the client offered the given TLS 1.3 cipher suite.
+    #[must_use]
+    pub const fn offers_cipher_suite(&self, suite: Tls13CipherSuiteId) -> bool {
+        let bit = match suite {
+            Tls13CipherSuiteId::Aes128GcmSha256 => 1 << 0,
+            Tls13CipherSuiteId::Aes256GcmSha384 => 1 << 1,
+            Tls13CipherSuiteId::ChaCha20Poly1305Sha256 => 1 << 2,
+        };
+        (self.offered_tls13_ciphers & bit) != 0
+    }
+
     /// Returns `true` if the extracted SNI matches any entry in `server_names`
     /// using exact ASCII case-insensitive comparison.
     #[must_use]
@@ -314,6 +344,9 @@ pub fn inspect_client_hello(buf: &[u8], max_bytes: usize) -> InspectOutcome {
     };
     if first_record_end > max_bytes {
         return InspectOutcome::Fallback(FallbackReason::Oversize);
+    }
+    if first_header.fragment_len == 0 || first_header.fragment_len > MAX_TLS_RECORD_FRAGMENT {
+        return InspectOutcome::Fallback(FallbackReason::Malformed);
     }
 
     let Some(first_fragment) = buf.get(5..first_record_end) else {
@@ -563,9 +596,14 @@ fn parse_client_hello_body(
     }
     let cipher_suites_raw = r.read_slice(cipher_suites_len)?;
     let mut offered_tls13_ciphers: u8 = 0;
+    let mut preferred_tls13_cipher: Option<Tls13CipherSuiteId> = None;
     for pair in cipher_suites_raw.chunks_exact(2) {
         if let (Some(&b0), Some(&b1)) = (pair.first(), pair.get(1)) {
-            match u16::from_be_bytes([b0, b1]) {
+            let suite_u16 = u16::from_be_bytes([b0, b1]);
+            if preferred_tls13_cipher.is_none() {
+                preferred_tls13_cipher = Tls13CipherSuiteId::from_u16(suite_u16);
+            }
+            match suite_u16 {
                 0x1301 => offered_tls13_ciphers |= 1 << 0,
                 0x1302 => offered_tls13_ciphers |= 1 << 1,
                 0x1303 => offered_tls13_ciphers |= 1 << 2,
@@ -645,6 +683,7 @@ fn parse_client_hello_body(
         offered_alpn,
         key_shares,
         offers_tls13,
+        preferred_tls13_cipher,
         offered_tls13_ciphers,
         wire_bytes_len,
         handshake_raw: handshake_raw.to_vec(),
@@ -804,7 +843,7 @@ impl<'a> SliceReader<'a> {
 }
 
 /// Supported TLS 1.3 cipher suites for Reality handshake mimicry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tls13CipherSuiteId {
     /// `TLS_AES_128_GCM_SHA256` (`0x1301`)
     Aes128GcmSha256,
@@ -847,7 +886,7 @@ pub enum SelectedGroup {
 }
 
 /// Handshake profile learned from `dest`'s server flight for authenticated-path mimicry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DestServerProfile {
     /// Raw `ServerHello` handshake message (`0x02 || u24_len || body`) from `dest`.
     pub server_hello_raw: Vec<u8>,
@@ -861,9 +900,26 @@ pub struct DestServerProfile {
     pub selected_group: SelectedGroup,
     /// Whether `dest` sent a middlebox-compatibility `ChangeCipherSpec` record.
     pub send_ccs: bool,
+    /// Number of `0x17` encrypted records recorded in `encrypted_record_lens` (`0..=5`).
+    pub encrypted_record_count: usize,
     /// Recorded encrypted handshake wire record lengths:
     /// `[EncryptedExtensions, Certificate, CertificateVerify, Finished, NewSessionTicket]`.
     pub encrypted_record_lens: [usize; 5],
+}
+
+impl core::fmt::Debug for DestServerProfile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DestServerProfile")
+            .field("server_hello_raw_len", &self.server_hello_raw.len())
+            .field("key_exchange_offset", &self.key_exchange_offset)
+            .field("key_exchange_len", &self.key_exchange_len)
+            .field("cipher_suite", &self.cipher_suite)
+            .field("selected_group", &self.selected_group)
+            .field("send_ccs", &self.send_ccs)
+            .field("encrypted_record_count", &self.encrypted_record_count)
+            .field("encrypted_record_lens", &self.encrypted_record_lens)
+            .finish()
+    }
 }
 
 impl DestServerProfile {
@@ -944,6 +1000,9 @@ pub fn parse_dest_server_flight(buf: &[u8]) -> ServerFlightStatus {
     let Some(sh_hs_total) = 4usize.checked_add(sh_hs_len) else {
         return ServerFlightStatus::Invalid;
     };
+    if sh_payload.len() != sh_hs_total {
+        return ServerFlightStatus::Invalid;
+    }
     let Some(sh_raw) = sh_payload.get(..sh_hs_total) else {
         return ServerFlightStatus::Invalid;
     };
@@ -1018,14 +1077,15 @@ pub fn parse_dest_server_flight(buf: &[u8]) -> ServerFlightStatus {
         cipher_suite: parsed_sh.cipher_suite,
         selected_group: parsed_sh.selected_group,
         send_ccs,
+        encrypted_record_count: enc_count,
         encrypted_record_lens,
     };
 
     // Many production TLS 1.3 stacks (Cloudflare, BoringSSL, Nginx, Go) coalesce
     // EncryptedExtensions + Certificate + CertificateVerify + Finished into a
-    // single 0x17 record (>= 350 bytes) rather than 4 separate 0x17 records.
+    // single 0x17 record (>= 350 bytes) optionally followed by 1..2 NewSessionTicket records.
     let is_coalesced_flight =
-        enc_count == 1 && encrypted_record_lens.first().copied().unwrap_or(0) >= 350;
+        (1..=3).contains(&enc_count) && encrypted_record_lens.first().copied().unwrap_or(0) >= 350;
 
     if enc_count >= 4 || is_coalesced_flight {
         ServerFlightStatus::Complete(Box::new(profile))
@@ -1101,7 +1161,7 @@ fn parse_server_hello_body(
         let ext_data = er.read_slice(data_len)?;
 
         if ext_type == EXT_SUPPORTED_VERSIONS {
-            if ext_data.len() != 2 {
+            if is_tls13 || ext_data.len() != 2 {
                 return Err(FallbackReason::Malformed);
             }
             let b0 = *ext_data.first().ok_or(FallbackReason::Malformed)?;
@@ -1111,6 +1171,9 @@ fn parse_server_hello_body(
             }
             is_tls13 = true;
         } else if ext_type == EXT_KEY_SHARE {
+            if key_share_info.is_some() {
+                return Err(FallbackReason::Malformed);
+            }
             let mut kr = SliceReader::new(ext_data);
             let group_raw = kr.read_u16()?;
             let key_len = usize::from(kr.read_u16()?);
@@ -1138,6 +1201,10 @@ fn parse_server_hello_body(
                 return Err(FallbackReason::Malformed);
             }
             key_share_info = Some((group, key_offset, key_len));
+        } else {
+            // Reject pre_shared_key (0x0029) and any unexpected ServerHello extensions
+            // so PSK-resumed flights can never poison DestProfileCache.
+            return Err(FallbackReason::Malformed);
         }
     }
 
@@ -1415,6 +1482,7 @@ mod tests {
             cipher_suite: Tls13CipherSuiteId::Aes128GcmSha256,
             selected_group: SelectedGroup::X25519,
             send_ccs: true,
+            encrypted_record_count: 5,
             encrypted_record_lens: [80, 1100, 128, 96, 200],
         };
 
@@ -1427,6 +1495,89 @@ mod tests {
                 Some(HELLO_RETRY_REQUEST_RANDOM.as_slice())
             );
             assert_eq!(a.server_hello_raw.get(39..71), Some(new_sid.as_slice()));
+            let dbg = format!("{a:?}");
+            assert!(!dbg.contains("153"));
+            assert!(dbg.contains("server_hello_raw_len"));
         }
+    }
+
+    #[test]
+    fn parse_dest_server_flight_rejects_psk_and_classifies_coalesced_plus_nst() {
+        let mut sh_exts = Vec::new();
+        // supported_versions = 0x0304
+        sh_exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        // key_share = X25519 (0x001d, 32 bytes)
+        sh_exts.extend_from_slice(&[0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
+        sh_exts.extend([0xABu8; 32]);
+
+        let mut sh_body = Vec::new();
+        sh_body.extend_from_slice(&[0x03, 0x03]);
+        sh_body.extend([0x12u8; 32]);
+        sh_body.push(32);
+        sh_body.extend([0x34u8; 32]);
+        sh_body.extend_from_slice(&[0x13, 0x01, 0x00]);
+        sh_body.extend_from_slice(&(sh_exts.len() as u16).to_be_bytes());
+        sh_body.extend_from_slice(&sh_exts);
+
+        let mut sh_hs = vec![0x02];
+        let sh_len_bytes = (sh_body.len() as u32).to_be_bytes();
+        if let Some(t) = sh_len_bytes.get(1..4) {
+            sh_hs.extend_from_slice(t);
+        }
+        sh_hs.extend_from_slice(&sh_body);
+
+        // Coalesced flight: 1 large 0x17 record (500 bytes) + 1 NST (250 bytes)
+        let mut flight = Vec::new();
+        flight.push(0x16);
+        flight.extend_from_slice(&[0x03, 0x03]);
+        flight.extend_from_slice(&(sh_hs.len() as u16).to_be_bytes());
+        flight.extend_from_slice(&sh_hs);
+        flight.extend_from_slice(&[0x17, 0x03, 0x03]);
+        flight.extend_from_slice(&495u16.to_be_bytes());
+        flight.extend(core::iter::repeat_n(0xAA, 495));
+        flight.extend_from_slice(&[0x17, 0x03, 0x03]);
+        flight.extend_from_slice(&245u16.to_be_bytes());
+        flight.extend(core::iter::repeat_n(0xBB, 245));
+
+        match parse_dest_server_flight(&flight) {
+            ServerFlightStatus::Complete(p) => {
+                assert_eq!(p.encrypted_record_count, 2);
+                assert_eq!(p.encrypted_record_lens[0], 500);
+                assert_eq!(p.encrypted_record_lens[1], 250);
+            }
+            other => assert!(
+                matches!(other, ServerFlightStatus::Complete(_)),
+                "unexpected: {other:?}"
+            ),
+        }
+
+        // Now add pre_shared_key (0x0029) -> must return Invalid.
+        let mut psk_exts = sh_exts;
+        psk_exts.extend_from_slice(&[0x00, 0x29, 0x00, 0x02, 0x00, 0x00]);
+        let mut psk_body = Vec::new();
+        psk_body.extend_from_slice(&[0x03, 0x03]);
+        psk_body.extend([0x12u8; 32]);
+        psk_body.push(32);
+        psk_body.extend([0x34u8; 32]);
+        psk_body.extend_from_slice(&[0x13, 0x01, 0x00]);
+        psk_body.extend_from_slice(&(psk_exts.len() as u16).to_be_bytes());
+        psk_body.extend_from_slice(&psk_exts);
+        let mut psk_hs = vec![0x02];
+        let psk_len_bytes = (psk_body.len() as u32).to_be_bytes();
+        if let Some(t) = psk_len_bytes.get(1..4) {
+            psk_hs.extend_from_slice(t);
+        }
+        psk_hs.extend_from_slice(&psk_body);
+        let mut psk_flight = vec![0x16, 0x03, 0x03];
+        psk_flight.extend_from_slice(&(psk_hs.len() as u16).to_be_bytes());
+        psk_flight.extend_from_slice(&psk_hs);
+        psk_flight.extend_from_slice(&[0x17, 0x03, 0x03]);
+        psk_flight.extend_from_slice(&495u16.to_be_bytes());
+        psk_flight.extend(core::iter::repeat_n(0xAA, 495));
+
+        assert_eq!(
+            parse_dest_server_flight(&psk_flight),
+            ServerFlightStatus::Invalid
+        );
     }
 }

@@ -6,7 +6,7 @@
 use core::fmt;
 
 use aes_gcm::{
-    aead::{AeadInOut, KeyInit as AeadKeyInit, Nonce as AeadNonce},
+    aead::{AeadInOut, KeyInit as AeadKeyInit, Nonce as AeadNonce, Tag as AeadTag},
     Aes128Gcm, Aes256Gcm,
 };
 use chacha20poly1305::ChaCha20Poly1305;
@@ -15,7 +15,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit as MacKeyInit, Mac};
 use ml_kem::{ml_kem_768::EncapsulationKey as MlKem768Ek, Key as MlKemKey, B32};
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConstantTimeEq};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -26,6 +26,7 @@ use crate::tls_parser::{
 
 /// Errors produced by cryptographic primitives (no secrets embedded).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CryptoError {
     /// Invalid hexadecimal encoding or length.
     InvalidEncoding,
@@ -47,11 +48,29 @@ pub enum CryptoError {
     VerificationFailed,
 }
 
-/// Static X25519 server private key (`ZeroizeOnDrop`, redacted `Debug`).
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+impl fmt::Display for CryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEncoding => f.write_str("invalid cryptographic encoding or length"),
+            Self::EmptyShortIdNotAllowed => f.write_str("empty Reality ShortID is not allowed"),
+            Self::NonContributorySharedSecret => {
+                f.write_str("non-contributory X25519 shared secret")
+            }
+            Self::KeyDerivationFailed => f.write_str("HKDF key derivation failed"),
+            Self::AeadFailed => f.write_str("AEAD authentication or encryption failed"),
+            Self::InvalidMlKemKey => f.write_str("invalid ML-KEM-768 encapsulation key"),
+            Self::SequenceExhausted => f.write_str("TLS 1.3 record sequence number exhausted"),
+            Self::InvalidRecord => f.write_str("malformed TLS 1.3 record"),
+            Self::VerificationFailed => f.write_str("cryptographic verification failed"),
+        }
+    }
+}
+
+impl core::error::Error for CryptoError {}
+
+/// Static X25519 server private key (`ZeroizeOnDrop` via `X25519StaticSecret`, redacted `Debug`).
+#[derive(Clone)]
 pub struct StaticPrivateKey {
-    bytes: Box<[u8; 32]>,
-    #[zeroize(skip)]
     secret: Box<X25519StaticSecret>,
 }
 
@@ -60,12 +79,8 @@ impl StaticPrivateKey {
     #[must_use]
     pub fn from_bytes(mut bytes: [u8; 32]) -> Self {
         let secret = Box::new(X25519StaticSecret::from(bytes));
-        let boxed_bytes = Box::new(bytes);
         bytes.zeroize();
-        Self {
-            bytes: boxed_bytes,
-            secret,
-        }
+        Self { secret }
     }
 
     /// Parses a 64-character hexadecimal X25519 private key without leaving
@@ -99,14 +114,16 @@ impl StaticPrivateKey {
     /// `Zeroizing<String>` (for `keygen` CLI output).
     #[must_use]
     pub fn to_base64url(&self) -> Zeroizing<String> {
-        Zeroizing::new(encode_base64url(self.bytes.as_slice()))
+        let raw = Zeroizing::new(self.secret.to_bytes());
+        Zeroizing::new(encode_base64url(raw.as_slice()))
     }
 
     /// Encodes the raw private key bytes as lowercase hexadecimal inside a
     /// `Zeroizing<String>` (for `keygen` CLI output).
     #[must_use]
     pub fn to_hex(&self) -> Zeroizing<String> {
-        Zeroizing::new(encode_hex(self.bytes.as_slice()))
+        let raw = Zeroizing::new(self.secret.to_bytes());
+        Zeroizing::new(encode_hex(raw.as_slice()))
     }
 
     /// Returns the corresponding 32-byte X25519 public key.
@@ -209,11 +226,11 @@ impl ShortId {
         decode_hex_exact(trimmed, dst)?;
         Ok(Self::from_bytes(*out))
     }
+}
 
-    /// Constant-time comparison with another `ShortId`.
-    #[must_use]
-    pub fn ct_eq(&self, other: &Self) -> bool {
-        bool::from(self.bytes.as_slice().ct_eq(other.bytes.as_slice()))
+impl ConstantTimeEq for ShortId {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.bytes.as_slice().ct_eq(other.bytes.as_slice())
     }
 }
 
@@ -280,33 +297,22 @@ pub fn decrypt_reality_session_id(
     let cipher =
         Aes256Gcm::new_from_slice(auth_key.as_bytes()).map_err(|_| CryptoError::AeadFailed)?;
 
-    let mut buf = Zeroizing::new(session_id.to_vec());
+    let (ct_slice, tag_slice) = session_id.split_at(16);
+    let mut buf = Zeroizing::new([0u8; 16]);
+    buf.copy_from_slice(ct_slice);
+    let tag = AeadTag::<Aes256Gcm>::try_from(tag_slice).map_err(|_| CryptoError::AeadFailed)?;
+
     cipher
-        .decrypt_in_place(&nonce, aad_zeroed_ch, &mut *buf)
+        .decrypt_inout_detached(&nonce, aad_zeroed_ch, buf.as_mut_slice().into(), &tag)
         .map_err(|_| CryptoError::AeadFailed)?;
 
-    if buf.len() != 16 {
-        return Err(CryptoError::AeadFailed);
-    }
-
-    let v0 = *buf.first().ok_or(CryptoError::AeadFailed)?;
-    let v1 = *buf.get(1).ok_or(CryptoError::AeadFailed)?;
-    let v2 = *buf.get(2).ok_or(CryptoError::AeadFailed)?;
-    let padding = *buf.get(3).ok_or(CryptoError::AeadFailed)?;
-    let t0 = *buf.get(4).ok_or(CryptoError::AeadFailed)?;
-    let t1 = *buf.get(5).ok_or(CryptoError::AeadFailed)?;
-    let t2 = *buf.get(6).ok_or(CryptoError::AeadFailed)?;
-    let t3 = *buf.get(7).ok_or(CryptoError::AeadFailed)?;
-    let sid_slice = buf.get(8..16).ok_or(CryptoError::AeadFailed)?;
-
-    let mut sid_arr = [0u8; 8];
-    sid_arr.copy_from_slice(sid_slice);
+    let [v0, v1, v2, padding, t0, t1, t2, t3, sid @ ..] = *buf;
 
     Ok(RealityToken {
         client_version: [v0, v1, v2],
         padding,
         timestamp_secs: u32::from_be_bytes([t0, t1, t2, t3]),
-        short_id: ShortId::from_bytes(sid_arr),
+        short_id: ShortId::from_bytes(sid),
     })
 }
 
@@ -326,14 +332,14 @@ pub fn encrypt_reality_session_id(
     let cipher =
         Aes256Gcm::new_from_slice(auth_key.as_bytes()).map_err(|_| CryptoError::AeadFailed)?;
 
-    let mut buf = Vec::with_capacity(32);
+    let mut buf = Zeroizing::new(Vec::with_capacity(32));
     buf.extend_from_slice(&token.client_version);
     buf.push(token.padding);
     buf.extend_from_slice(&token.timestamp_secs.to_be_bytes());
     buf.extend_from_slice(token.short_id.bytes.as_slice());
 
     cipher
-        .encrypt_in_place(&nonce, aad_zeroed_ch, &mut buf)
+        .encrypt_in_place(&nonce, aad_zeroed_ch, &mut *buf)
         .map_err(|_| CryptoError::AeadFailed)?;
 
     if buf.len() != 32 {
@@ -436,8 +442,8 @@ fn build_ed25519_x509_template(signing_key: &SigningKey, pubkey: &[u8; 32]) -> V
     const ED25519_ALG_ID: &[u8] = &[0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70];
     // Version v3: [0] EXPLICIT INTEGER 2
     const VERSION_V3: &[u8] = &[0xA0, 0x03, 0x02, 0x01, 0x02];
-    // SerialNumber: INTEGER 0
-    const SERIAL_ZERO: &[u8] = &[0x02, 0x01, 0x00];
+    // SerialNumber: INTEGER 1 (RFC 5280 §4.1.2.2 requires positive integer)
+    const SERIAL_ONE: &[u8] = &[0x02, 0x01, 0x01];
     // Empty Name: SEQUENCE {}
     const EMPTY_NAME: &[u8] = &[0x30, 0x00];
     // Validity: 2025-01-01 to 2035-01-01 (UTCTime)
@@ -455,7 +461,7 @@ fn build_ed25519_x509_template(signing_key: &SigningKey, pubkey: &[u8; 32]) -> V
 
     let mut tbs_body = Vec::with_capacity(128);
     tbs_body.extend_from_slice(VERSION_V3);
-    tbs_body.extend_from_slice(SERIAL_ZERO);
+    tbs_body.extend_from_slice(SERIAL_ONE);
     tbs_body.extend_from_slice(ED25519_ALG_ID);
     tbs_body.extend_from_slice(EMPTY_NAME);
     tbs_body.extend_from_slice(VALIDITY);
@@ -506,10 +512,10 @@ pub struct Tls13KeyAgreementResult {
 pub fn compute_tls13_server_key_exchange(
     selected_group: SelectedGroup,
     client_shares: &KeyShares,
-    x25519_ephemeral_seed: [u8; 32],
-    mlkem_randomness: [u8; 32],
+    x25519_ephemeral_seed: &[u8; 32],
+    mlkem_randomness: &[u8; 32],
 ) -> Result<Tls13KeyAgreementResult, CryptoError> {
-    let eph_secret = X25519StaticSecret::from(x25519_ephemeral_seed);
+    let eph_secret = X25519StaticSecret::from(*x25519_ephemeral_seed);
     let eph_pub = X25519PublicKey::from(&eph_secret).to_bytes();
 
     match selected_group {
@@ -544,7 +550,9 @@ pub fn compute_tls13_server_key_exchange(
             let ek_arr = MlKemKey::<MlKem768Ek>::try_from(ek_slice)
                 .map_err(|_| CryptoError::InvalidMlKemKey)?;
             let ek = MlKem768Ek::new(&ek_arr).map_err(|_| CryptoError::InvalidMlKemKey)?;
-            let (ct, mlkem_shared) = ek.encapsulate_deterministic(&B32::from(mlkem_randomness));
+            let mlkem_rand = Zeroizing::new(B32::from(*mlkem_randomness));
+            let (ct, mlkem_shared) = ek.encapsulate_deterministic(&mlkem_rand);
+            let mlkem_shared = Zeroizing::new(mlkem_shared);
 
             let mut server_share = Vec::with_capacity(1120);
             server_share.extend_from_slice(ct.as_slice());
@@ -604,7 +612,7 @@ impl TranscriptHash {
 pub struct Tls13Secret {
     #[zeroize(skip)]
     suite: Tls13CipherSuiteId,
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
 }
 
 impl Tls13Secret {
@@ -612,7 +620,7 @@ impl Tls13Secret {
     #[must_use]
     pub fn early_secret(suite: Tls13CipherSuiteId) -> Self {
         let len = suite_hash_len(suite);
-        let zeros = vec![0u8; len];
+        let zeros = Zeroizing::new(vec![0u8; len]);
         let prk = hkdf_extract(suite, Some(&zeros), &zeros);
         Self { suite, bytes: prk }
     }
@@ -632,7 +640,7 @@ impl Tls13Secret {
     pub fn derive_master_secret(&self) -> Result<Self, CryptoError> {
         let empty_hash = empty_transcript_hash(self.suite);
         let derived = self.derive_secret(b"derived", &empty_hash)?;
-        let zeros = vec![0u8; suite_hash_len(self.suite)];
+        let zeros = Zeroizing::new(vec![0u8; suite_hash_len(self.suite)]);
         let prk = hkdf_extract(self.suite, Some(&derived.bytes), &zeros);
         Ok(Self {
             suite: self.suite,
@@ -656,7 +664,7 @@ impl Tls13Secret {
         label: &[u8],
         context: &[u8],
         out_len: usize,
-    ) -> Result<Vec<u8>, CryptoError> {
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         let len_u16 = u16::try_from(out_len).map_err(|_| CryptoError::KeyDerivationFailed)?;
         let full_label_len = 6usize
             .checked_add(label.len())
@@ -684,7 +692,7 @@ impl Tls13Secret {
             context,
         ];
 
-        let mut out = vec![0u8; out_len];
+        let mut out = Zeroizing::new(vec![0u8; out_len]);
         match self.suite {
             Tls13CipherSuiteId::Aes128GcmSha256 | Tls13CipherSuiteId::ChaCha20Poly1305Sha256 => {
                 let hk = Hkdf::<Sha256>::from_prk(&self.bytes)
@@ -706,21 +714,21 @@ impl Tls13Secret {
     pub fn compute_finished_verify_data(
         &self,
         transcript_hash: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         let hash_len = suite_hash_len(self.suite);
-        let finished_key = Zeroizing::new(self.expand_label(b"finished", &[], hash_len)?);
+        let finished_key = self.expand_label(b"finished", &[], hash_len)?;
         let mac_bytes = match self.suite {
             Tls13CipherSuiteId::Aes128GcmSha256 | Tls13CipherSuiteId::ChaCha20Poly1305Sha256 => {
                 let mut mac = <Hmac<Sha256> as MacKeyInit>::new_from_slice(&finished_key)
                     .map_err(|_| CryptoError::KeyDerivationFailed)?;
                 mac.update(transcript_hash);
-                mac.finalize().into_bytes().to_vec()
+                Zeroizing::new(mac.finalize().into_bytes().to_vec())
             }
             Tls13CipherSuiteId::Aes256GcmSha384 => {
                 let mut mac = <Hmac<Sha384> as MacKeyInit>::new_from_slice(&finished_key)
                     .map_err(|_| CryptoError::KeyDerivationFailed)?;
                 mac.update(transcript_hash);
-                mac.finalize().into_bytes().to_vec()
+                Zeroizing::new(mac.finalize().into_bytes().to_vec())
             }
         };
         Ok(mac_bytes)
@@ -732,9 +740,9 @@ impl Tls13Secret {
             Tls13CipherSuiteId::Aes128GcmSha256 => 16,
             Tls13CipherSuiteId::Aes256GcmSha384 | Tls13CipherSuiteId::ChaCha20Poly1305Sha256 => 32,
         };
-        let key = Zeroizing::new(self.expand_label(b"key", &[], key_len)?);
-        let iv_vec = Zeroizing::new(self.expand_label(b"iv", &[], 12)?);
-        let mut iv = [0u8; 12];
+        let key = self.expand_label(b"key", &[], key_len)?;
+        let iv_vec = self.expand_label(b"iv", &[], 12)?;
+        let mut iv = Zeroizing::new([0u8; 12]);
         iv.copy_from_slice(&iv_vec);
 
         let cipher = match self.suite {
@@ -752,7 +760,7 @@ impl Tls13Secret {
 
         Ok(Tls13RecordCipher {
             cipher,
-            iv: Box::new(iv),
+            iv: Box::new(*iv),
             seq: 0,
         })
     }
@@ -825,6 +833,10 @@ impl Tls13RecordCipher {
         let inner_len = unpadded_inner
             .checked_add(zero_pad)
             .ok_or(CryptoError::InvalidRecord)?;
+        // RFC 8446 §5.4: TLSInnerPlaintext length MUST NOT exceed 2^14 + 1 = 16385.
+        if inner_len > MAX_TLS_RECORD_FRAGMENT.saturating_add(1) {
+            return Err(CryptoError::InvalidRecord);
+        }
         let ciphertext_len = inner_len
             .checked_add(16)
             .ok_or(CryptoError::InvalidRecord)?;
@@ -832,6 +844,10 @@ impl Tls13RecordCipher {
             return Err(CryptoError::InvalidRecord);
         }
         let ct_len_u16 = u16::try_from(ciphertext_len).map_err(|_| CryptoError::InvalidRecord)?;
+
+        // Obtain nonce BEFORE copying plaintext into `record` so SequenceExhausted
+        // never leaves plaintext in the caller buffer.
+        let nonce = self.next_nonce()?;
 
         let [ct0, ct1] = ct_len_u16.to_be_bytes();
         let aad: [u8; 5] = [0x17, 0x03, 0x03, ct0, ct1];
@@ -845,26 +861,43 @@ impl Tls13RecordCipher {
         record.push(inner_content_type);
         record.resize(5usize.saturating_add(inner_len), 0);
 
-        let nonce = self.next_nonce()?;
-        let body = record.get_mut(5..).ok_or(CryptoError::InvalidRecord)?;
-        let tag = match &self.cipher {
-            CipherKind::Aes128(c) => c
-                .encrypt_inout_detached(&AeadNonce::<Aes128Gcm>::from(nonce), &aad, body.into())
-                .map_err(|_| CryptoError::AeadFailed)?,
-            CipherKind::Aes256(c) => c
-                .encrypt_inout_detached(&AeadNonce::<Aes256Gcm>::from(nonce), &aad, body.into())
-                .map_err(|_| CryptoError::AeadFailed)?,
-            CipherKind::ChaCha20(c) => c
-                .encrypt_inout_detached(
-                    &AeadNonce::<ChaCha20Poly1305>::from(nonce),
-                    &aad,
-                    body.into(),
-                )
-                .map_err(|_| CryptoError::AeadFailed)?,
+        let Some(body) = record.get_mut(5..) else {
+            record.zeroize();
+            record.clear();
+            return Err(CryptoError::InvalidRecord);
+        };
+        let enc_res = match &self.cipher {
+            CipherKind::Aes128(c) => {
+                c.encrypt_inout_detached(&AeadNonce::<Aes128Gcm>::from(nonce), &aad, body.into())
+            }
+            CipherKind::Aes256(c) => {
+                c.encrypt_inout_detached(&AeadNonce::<Aes256Gcm>::from(nonce), &aad, body.into())
+            }
+            CipherKind::ChaCha20(c) => c.encrypt_inout_detached(
+                &AeadNonce::<ChaCha20Poly1305>::from(nonce),
+                &aad,
+                body.into(),
+            ),
+        };
+        let Ok(tag) = enc_res else {
+            record.zeroize();
+            record.clear();
+            return Err(CryptoError::AeadFailed);
         };
 
         record.extend_from_slice(tag.as_slice());
         Ok(())
+    }
+
+    /// Encrypts a TLS 1.3 `close_notify` alert (`0x15` inner content type,
+    /// warning level `0x01`, `close_notify` description `0x00`) into `record`.
+    pub fn seal_close_notify_into(&mut self, record: &mut Vec<u8>) -> Result<(), CryptoError> {
+        self.seal_record_into(0x15, &[0x01, 0x00], None, record)
+    }
+
+    /// Encrypts a TLS 1.3 `close_notify` alert into a freshly allocated buffer.
+    pub fn seal_close_notify(&mut self) -> Result<Vec<u8>, CryptoError> {
+        self.seal_record(0x15, &[0x01, 0x00], None)
     }
 
     /// Encrypts a TLS 1.3 record, optionally zero-padding the inner plaintext so
@@ -938,6 +971,11 @@ impl Tls13RecordCipher {
             return Err(CryptoError::AeadFailed);
         }
 
+        if out.len() > MAX_TLS_RECORD_FRAGMENT.saturating_add(1) {
+            out.zeroize();
+            return Err(CryptoError::InvalidRecord);
+        }
+
         while out.last() == Some(&0) {
             out.pop();
         }
@@ -987,15 +1025,15 @@ fn empty_transcript_hash(suite: Tls13CipherSuiteId) -> Vec<u8> {
     }
 }
 
-fn hkdf_extract(suite: Tls13CipherSuiteId, salt: Option<&[u8]>, ikm: &[u8]) -> Vec<u8> {
+fn hkdf_extract(suite: Tls13CipherSuiteId, salt: Option<&[u8]>, ikm: &[u8]) -> Zeroizing<Vec<u8>> {
     match suite {
         Tls13CipherSuiteId::Aes128GcmSha256 | Tls13CipherSuiteId::ChaCha20Poly1305Sha256 => {
             let (prk, _) = Hkdf::<Sha256>::extract(salt, ikm);
-            prk.to_vec()
+            Zeroizing::new(prk.to_vec())
         }
         Tls13CipherSuiteId::Aes256GcmSha384 => {
             let (prk, _) = Hkdf::<Sha384>::extract(salt, ikm);
-            prk.to_vec()
+            Zeroizing::new(prk.to_vec())
         }
     }
 }
@@ -1142,33 +1180,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reality_session_id_roundtrip_and_tampered_aad_fails() {
+    fn reality_session_id_roundtrip_and_tampered_aad_fails() -> Result<(), CryptoError> {
         let server_priv = StaticPrivateKey::from_bytes([0x1Au8; 32]);
         let server_pub = server_priv.public_key();
 
         let client_eph = StaticPrivateKey::from_bytes([0x2Bu8; 32]);
         let client_pub = client_eph.public_key();
 
-        let client_shared = client_eph.diffie_hellman(&server_pub);
-        assert!(client_shared.is_ok());
-        let server_shared = server_priv.diffie_hellman(&client_pub);
-        assert!(server_shared.is_ok());
-
-        let Ok(cs) = client_shared else { return };
-        let Ok(ss) = server_shared else { return };
+        let cs = client_eph.diffie_hellman(&server_pub)?;
+        let ss = server_priv.diffie_hellman(&client_pub)?;
         assert_eq!(cs.as_bytes(), ss.as_bytes());
 
         let client_random = [0x3Cu8; 32];
-        let Ok(client_auth) = derive_reality_auth_key(&cs, &client_random) else {
-            return;
-        };
-        let Ok(server_auth) = derive_reality_auth_key(&ss, &client_random) else {
-            return;
-        };
+        let client_auth = derive_reality_auth_key(&cs, &client_random)?;
+        let server_auth = derive_reality_auth_key(&ss, &client_random)?;
 
-        let Ok(short_id) = ShortId::from_hex("0123abcd") else {
-            return;
-        };
+        let short_id = ShortId::from_hex("0123abcd")?;
         let token = RealityToken {
             client_version: [1, 8, 24],
             padding: 0,
@@ -1177,18 +1204,12 @@ mod tests {
         };
 
         let aad = vec![0x01u8; 120];
-        let Ok(sid_ct) = encrypt_reality_session_id(&client_auth, &client_random, &token, &aad)
-        else {
-            return;
-        };
+        let sid_ct = encrypt_reality_session_id(&client_auth, &client_random, &token, &aad)?;
 
-        let decoded = decrypt_reality_session_id(&server_auth, &client_random, &sid_ct, &aad);
-        assert!(decoded.is_ok());
-        if let Ok(tok) = decoded {
-            assert_eq!(tok.client_version, [1, 8, 24]);
-            assert_eq!(tok.timestamp_secs, 1_763_444_000);
-            assert!(tok.short_id.ct_eq(&short_id));
-        }
+        let tok = decrypt_reality_session_id(&server_auth, &client_random, &sid_ct, &aad)?;
+        assert_eq!(tok.client_version, [1, 8, 24]);
+        assert_eq!(tok.timestamp_secs, 1_763_444_000);
+        assert!(bool::from(tok.short_id.ct_eq(&short_id)));
 
         let mut tampered_aad = aad;
         if let Some(b) = tampered_aad.get_mut(10) {
@@ -1198,25 +1219,23 @@ mod tests {
             decrypt_reality_session_id(&server_auth, &client_random, &sid_ct, &tampered_aad).err(),
             Some(CryptoError::AeadFailed)
         );
+        Ok(())
     }
 
     #[test]
-    fn cert_forge_replaces_last_64_bytes_with_hmac_sha512() {
+    fn cert_forge_replaces_last_64_bytes_with_hmac_sha512() -> Result<(), CryptoError> {
         let tmpl = RealityCertTemplate::from_seed([0x44u8; 32]);
         let auth_key = AuthKey {
             bytes: Box::new([0x55u8; 32]),
         };
-        let cert_res = tmpl.forge_cert_der(&auth_key);
-        assert!(cert_res.is_ok());
-        if let Ok(cert) = cert_res {
-            let sig_slice = cert.get(cert.len().saturating_sub(64)..);
-            let mut mac = <Hmac<Sha512> as MacKeyInit>::new_from_slice(auth_key.as_bytes()).ok();
-            if let Some(ref mut m) = mac {
-                m.update(tmpl.public_key_bytes());
-                let expected = m.clone().finalize().into_bytes();
-                assert_eq!(sig_slice, Some(expected.as_slice()));
-            }
-        }
+        let cert = tmpl.forge_cert_der(&auth_key)?;
+        let sig_slice = cert.get(cert.len().saturating_sub(64)..);
+        let mut mac = <Hmac<Sha512> as MacKeyInit>::new_from_slice(auth_key.as_bytes())
+            .map_err(|_| CryptoError::AeadFailed)?;
+        mac.update(tmpl.public_key_bytes());
+        let expected = mac.finalize().into_bytes();
+        assert_eq!(sig_slice, Some(expected.as_slice()));
+        Ok(())
     }
 
     #[test]
@@ -1230,28 +1249,32 @@ mod tests {
     }
 
     #[test]
-    fn tls13_record_seal_and_open_with_padding() {
+    fn tls13_record_seal_and_open_with_padding() -> Result<(), CryptoError> {
         let secret = Tls13Secret {
             suite: Tls13CipherSuiteId::Aes128GcmSha256,
-            bytes: vec![0x7Au8; 32],
+            bytes: Zeroizing::new(vec![0x7Au8; 32]),
         };
-        let Ok(mut writer) = secret.into_record_cipher() else {
-            return;
-        };
-        let Ok(mut reader) = secret.into_record_cipher() else {
-            return;
-        };
+        let mut writer = secret.into_record_cipher()?;
+        let mut reader = secret.into_record_cipher()?;
 
-        let Ok(rec) = writer.seal_record(0x16, b"hello reality", Some(128)) else {
-            return;
-        };
+        let rec = writer.seal_record(0x16, b"hello reality", Some(128))?;
         assert_eq!(rec.len(), 128);
-        let opened = reader.open_record(&rec);
-        assert_eq!(opened, Ok((0x16, b"hello reality".to_vec())));
+        let opened = reader.open_record(&rec)?;
+        assert_eq!(opened, (0x16, b"hello reality".to_vec()));
+
+        // RFC 8446 §5.4: TLSInnerPlaintext length > 16385 must be rejected.
+        assert_eq!(
+            writer.seal_record(0x17, &[0u8; 100], Some(5 + 16_386 + 16)),
+            Err(CryptoError::InvalidRecord)
+        );
+
+        let cn = writer.seal_close_notify()?;
+        assert_eq!(reader.open_record(&cn)?, (0x15, vec![0x01, 0x00]));
+        Ok(())
     }
 
     #[test]
-    fn base64url_and_hex_private_key_roundtrip() {
+    fn base64url_and_hex_private_key_roundtrip() -> Result<(), CryptoError> {
         let raw = [0x42u8; 32];
         let key = StaticPrivateKey::from_bytes(raw);
         let b64 = key.to_base64url();
@@ -1259,14 +1282,10 @@ mod tests {
         assert_eq!(b64.len(), 43);
         assert_eq!(hex.len(), 64);
 
-        let from_b64 = StaticPrivateKey::from_encoded(&b64);
-        let from_hex = StaticPrivateKey::from_encoded(&hex);
-        assert!(from_b64.is_ok());
-        assert!(from_hex.is_ok());
-        if let (Ok(k1), Ok(k2)) = (from_b64, from_hex) {
-            assert_eq!(k1.public_key(), key.public_key());
-            assert_eq!(k2.public_key(), key.public_key());
-        }
+        let k1 = StaticPrivateKey::from_encoded(&b64)?;
+        let k2 = StaticPrivateKey::from_encoded(&hex)?;
+        assert_eq!(k1.public_key(), key.public_key());
+        assert_eq!(k2.public_key(), key.public_key());
 
         // Non-canonical trailing bits in 43rd Base64url char must be rejected.
         let mut bad_b64 = (*b64).clone();
@@ -1276,5 +1295,6 @@ mod tests {
             StaticPrivateKey::from_base64url(&bad_b64).err(),
             Some(CryptoError::InvalidEncoding)
         );
+        Ok(())
     }
 }

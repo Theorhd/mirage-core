@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     esac; \
     CPU_FLAG=""; \
     if [ -n "${RUST_TARGET_CPU}" ]; then CPU_FLAG="-C target-cpu=${RUST_TARGET_CPU}"; fi; \
-    RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C link-arg=-Wl,-z,relro,-z,now --remap-path-prefix=/build=/src ${CPU_FLAG}" \
+    RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C link-arg=-Wl,-z,relro,-z,now --remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo ${CPU_FLAG}" \
     cargo build --release --locked --bin miraged --target "$TARGET"; \
     cp "/build/target/${TARGET}/release/miraged" /miraged; \
     chmod 0555 /miraged

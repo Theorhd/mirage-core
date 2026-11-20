@@ -2,18 +2,24 @@
 /target
 /fuzz/target
 /fuzz/Cargo.lock
+/fuzz/corpus/
 **/*.rs.bk
 *.pdb
 
 # Sensitive configuration & environment files
 config.toml
+config.*.toml
 *.local.toml
 .env
 .env.*
+*.env
 !.env.example
 *.key
 *.pem
 secrets/
+.mirage-local/
+clash-profile.yaml
+shadowrocket-vless.txt
 
 # Local-only documentation
 /docs/
@@ -25,3 +31,9 @@ secrets/
 *.swp
 *.swo
 *~
+
+# Audits Folder
+audits/
+
+# Graphify
+graphify-out/

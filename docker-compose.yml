@@ -1,6 +1,7 @@
 services:
   miraged:
-    image: ghcr.io/theorhd/mirage-core:latest
+    # Pin to a released version tag or immutable `@sha256:<digest>` in production.
+    image: ghcr.io/theorhd/mirage-core:v0.2.0
     user: "65534:65534"
     read_only: true
     cap_drop:
@@ -8,12 +9,11 @@ services:
     security_opt:
       - no-new-privileges:true
       - seccomp=./seccomp-miraged.json
-    # Host networking avoids docker-proxy userland NAT & nf_conntrack overhead
-    # for lower latency and stutter-free high-bitrate video streaming.
-    # On Linux, set `net.ipv4.ip_unprivileged_port_start=443` (via
-    # scripts/tune-linux-sysctl.sh) to bind port 443 directly as UID 65534,
-    # or switch back to bridge `ports: ["443:8443/tcp"]` if preferred.
-    network_mode: host
+    # Default bridge isolation: publish host TCP/443 -> container unprivileged 8443.
+    # For maximum throughput with zero userland NAT overhead, switch to
+    # `network_mode: host` (with CAP_NET_BIND_SERVICE or unprivileged listen port).
+    ports:
+      - "443:8443/tcp"
     pids_limit: 256
     mem_limit: 512m
     memswap_limit: 512m

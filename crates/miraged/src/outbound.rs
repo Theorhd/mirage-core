@@ -4,13 +4,13 @@
 use core::net::{IpAddr, SocketAddr};
 use core::time::Duration;
 
-use mirage_core::egress::EgressPolicy;
+use mirage_core::egress::{normalize_ip, EgressPolicy, TransportProtocol};
 use mirage_core::vless::VlessAddress;
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
 use crate::config::{Config, IpStrategy, VlessConfig};
-use crate::dns::DnsResolver;
+use crate::dns::{CachedLookup, DnsResolver};
 use crate::metrics::Metrics;
 use crate::net_opt::tune_tcp_stream;
 
@@ -38,6 +38,7 @@ pub struct EgressContext {
     pub ip_strategy: IpStrategy,
     pub happy_eyeballs_delay: Duration,
     pub tcp_keepalive: Duration,
+    pub half_close_timeout: Duration,
 }
 
 impl EgressContext {
@@ -58,10 +59,13 @@ impl EgressContext {
             ip_strategy: vless_cfg.ip_strategy(),
             happy_eyeballs_delay: config.happy_eyeballs_delay(),
             tcp_keepalive: config.tcp_keepalive(),
+            half_close_timeout: config.half_close_timeout(),
         }
     }
 
-    fn build_policy(&self) -> EgressPolicy {
+    /// Builds the `EgressPolicy` snapshot for target/peer validation.
+    #[must_use]
+    pub fn build_policy(&self) -> EgressPolicy {
         let mut blocked_ips = Vec::with_capacity(3);
         // Always block all daemon/dest/local IPs in production (`allow_private_egress = false`).
         // When `allow_private_egress = true` (local dev/tests), skip loopback IPs from whole-IP
@@ -74,8 +78,12 @@ impl EgressContext {
         .into_iter()
         .flatten()
         {
-            if !self.allow_private_egress || !ip.is_loopback() {
-                blocked_ips.push(ip);
+            let canon = match ip {
+                IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+                IpAddr::V4(_) => ip,
+            };
+            if (!self.allow_private_egress || !canon.is_loopback()) && !canon.is_unspecified() {
+                blocked_ips.push(canon);
             }
         }
 
@@ -87,14 +95,31 @@ impl EgressContext {
         }
     }
 
+    /// Returns `true` if `addr` targets our own listening socket or pinned `dest_addr`,
+    /// including multi-homed host IPs when `listen_addr` is wildcard (`0.0.0.0` / `::`).
+    fn is_self_loop_socket(&self, validated: SocketAddr) -> bool {
+        let norm_ip = normalize_ip(validated.ip());
+        let listen_norm = normalize_ip(self.listen_addr.ip());
+        let dest_norm = normalize_ip(self.dest_addr.ip());
+        if validated.port() == self.listen_addr.port() {
+            if norm_ip == listen_norm {
+                return true;
+            }
+            if self.listen_addr.ip().is_unspecified() && is_local_interface_ip(validated.ip()) {
+                return true;
+            }
+        }
+        validated.port() == self.dest_addr.port() && norm_ip == dest_norm
+    }
+
     fn validate_candidates(
         &self,
-        candidate_ips: Vec<IpAddr>,
+        candidate_ips: &[IpAddr],
         port: u16,
-        is_tcp: bool,
+        proto: TransportProtocol,
         metrics: &Metrics,
     ) -> Vec<SocketAddr> {
-        if !is_tcp && port == 443 && self.block_quic {
+        if proto == TransportProtocol::Udp && port == 443 && self.block_quic {
             metrics.inc_quic_blocked();
             metrics.inc_egress_blocked();
             return Vec::new();
@@ -106,17 +131,25 @@ impl EgressContext {
         let policy = self.build_policy();
         let mut v6 = Vec::new();
         let mut v4 = Vec::new();
-        for ip in candidate_ips {
+        for &ip in candidate_ips {
             if self.ip_strategy == IpStrategy::V4Only && ip.is_ipv6() {
                 continue;
             }
-            if let Ok(validated) = policy.validate_target(ip, port, is_tcp) {
-                if validated == self.listen_addr || validated == self.dest_addr {
+            if let Ok(validated) = policy.validate_target(ip, port, proto) {
+                if self.is_self_loop_socket(validated) {
                     continue;
                 }
                 match validated {
-                    SocketAddr::V6(_) => v6.push(validated),
-                    SocketAddr::V4(_) => v4.push(validated),
+                    SocketAddr::V6(_) => {
+                        if !v6.contains(&validated) {
+                            v6.push(validated);
+                        }
+                    }
+                    SocketAddr::V4(_) => {
+                        if !v4.contains(&validated) {
+                            v4.push(validated);
+                        }
+                    }
                 }
             }
         }
@@ -130,34 +163,42 @@ impl EgressContext {
 
     /// Synchronous cache-only lookup + `EgressPolicy` validation.
     ///
-    /// Returns `Some(targets)` for literal IPs, blocked QUIC, or DNS cache hits;
+    /// Returns `Some(targets)` for literal IPs, blocked QUIC, or DNS cache/negative hits;
     /// returns `None` ONLY when a domain requires an asynchronous DNS network query.
     #[must_use]
     pub fn try_resolve_cached_and_validate(
         &self,
         addr: &VlessAddress,
         port: u16,
-        is_tcp: bool,
+        proto: TransportProtocol,
         dns_resolver: Option<&DnsResolver>,
         metrics: &Metrics,
     ) -> Option<Vec<SocketAddr>> {
-        if !is_tcp && port == 443 && self.block_quic {
+        if proto == TransportProtocol::Udp && port == 443 && self.block_quic {
             metrics.inc_quic_blocked();
             metrics.inc_egress_blocked();
             return Some(Vec::new());
         }
 
         let v4_only = self.ip_strategy == IpStrategy::V4Only;
-        let candidate_ips = match addr {
-            VlessAddress::Ipv4(v4) => vec![IpAddr::V4(*v4)],
-            VlessAddress::Ipv6(v6) => vec![IpAddr::V6(*v6)],
+        match addr {
+            VlessAddress::Ipv4(v4) => {
+                Some(self.validate_candidates(&[IpAddr::V4(*v4)], port, proto, metrics))
+            }
+            VlessAddress::Ipv6(v6) => {
+                Some(self.validate_candidates(&[IpAddr::V6(*v6)], port, proto, metrics))
+            }
             VlessAddress::Domain(domain) => {
                 let resolver = dns_resolver?;
-                resolver.lookup_cached(domain, v4_only)?
+                match resolver.lookup_cached(domain, v4_only) {
+                    CachedLookup::Hit(ips) => {
+                        Some(self.validate_candidates(&ips, port, proto, metrics))
+                    }
+                    CachedLookup::NegativeHit => Some(Vec::new()),
+                    CachedLookup::Miss => None,
+                }
             }
-        };
-
-        Some(self.validate_candidates(candidate_ips, port, is_tcp, metrics))
+        }
     }
 
     /// Evaluates `EgressPolicy` over `(addr, port)` and returns all permitted
@@ -166,33 +207,42 @@ impl EgressContext {
         &self,
         addr: &VlessAddress,
         port: u16,
-        is_tcp: bool,
+        proto: TransportProtocol,
         dns_resolver: Option<&DnsResolver>,
         metrics: &Metrics,
     ) -> Vec<SocketAddr> {
-        if !is_tcp && port == 443 && self.block_quic {
+        if proto == TransportProtocol::Udp && port == 443 && self.block_quic {
             metrics.inc_quic_blocked();
             metrics.inc_egress_blocked();
             return Vec::new();
         }
 
         let v4_only = self.ip_strategy == IpStrategy::V4Only;
-        let candidate_ips: Vec<IpAddr> = match addr {
-            VlessAddress::Ipv4(v4) => vec![IpAddr::V4(*v4)],
-            VlessAddress::Ipv6(v6) => vec![IpAddr::V6(*v6)],
+        match addr {
+            VlessAddress::Ipv4(v4) => {
+                self.validate_candidates(&[IpAddr::V4(*v4)], port, proto, metrics)
+            }
+            VlessAddress::Ipv6(v6) => {
+                self.validate_candidates(&[IpAddr::V6(*v6)], port, proto, metrics)
+            }
             VlessAddress::Domain(domain) => {
                 let Some(resolver) = dns_resolver else {
                     return Vec::new();
                 };
-                resolver
-                    .resolve_for_strategy(domain, v4_only)
-                    .await
-                    .unwrap_or_default()
+                let Some(ips) = resolver.resolve_for_strategy(domain, v4_only).await else {
+                    return Vec::new();
+                };
+                self.validate_candidates(&ips, port, proto, metrics)
             }
-        };
-
-        self.validate_candidates(candidate_ips, port, is_tcp, metrics)
+        }
     }
+}
+
+fn is_local_interface_ip(ip: IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
 }
 
 /// Interleaves IPv4 and IPv6 candidates according to `strategy` so Happy Eyeballs
